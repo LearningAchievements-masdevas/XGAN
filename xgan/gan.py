@@ -1,68 +1,85 @@
 import numpy as np
-import torch
+
 import os
 import shutil
 import gc
 import hashlib
 import time
-from torchvision.utils import save_image
-from torchsummary import summary
 import logging
 from datetime import datetime
-import cv2
+from tqdm.auto import tqdm
 import json
+
+import torch
+from torch.utils.data import BatchSampler, RandomSampler, SequentialSampler
+
+from torchvision.utils import save_image
+from torchsummary import summary
+
+from xgan.xai import GradCam
+from xgan.xai import LIME
 
 real_label = 1.
 fake_label = 0.
-
-class GanException(Exception):
-    def __init__(self, value):
-        self.value = value
-
-    def __str__(self):
-        return self.value
 
 def create_batch_generator(data_loader):
     for index, (data, target) in enumerate(data_loader):
         yield index, (data, target)
 
-def discriminator_init(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+def create_tensor_batch_generator(data_tensor, indices, data_labels=None):
+    for batch_idx, samples_indices in enumerate(indices):
+        batch_data = data_tensor[samples_indices]
+        if data_labels is None:
+            yield batch_idx, (batch_data, 0)
+        else:
+            batch_labels = data_labels[samples_indices]
+            yield batch_idx, (batch_data, batch_labels)
 
 class GAN:
     def get_str_datetime(self):
         now = datetime.now()
-        dt_string = now.strftime("%d_%m_%Y-%H_%M_%S")
+        dt_string = now.strftime("%d_%m_%Y")
         return dt_string
 
-    def __init__(self, device, generator_config, discriminator_config, *, verbose=False, generation_config=None, explanation_config=None):
+    def __init__(self, device, generator_config, discriminator_config, *, verbose=False, explanation_config=None, dtype=torch.float32):
         self.device = device
+        self.dtype = dtype
         self.generator_config = generator_config
         self.generator = self.generator_config['model']
 
         self.generator_optimizer = self.generator_config['optimizer']
         self.discriminator_config = discriminator_config
         self.discriminator = self.discriminator_config['model']
-        #print(dir(self.discriminator.named_parameters()))
-        # for name, param in self.discriminator.named_parameters():
-        #     print(name, param.size())
-        #     print(type(param))
 
-
-        # os.exit(0)
         self.discriminator_optimizer = self.discriminator_config['optimizer']
         self.generator_config['model'].to(device)
         self.discriminator_config['model'].to(device)
-        self.verbose=verbose
-        self.generation_config = generation_config
+        self.verbose = verbose
         self.explanation_config = explanation_config
         self.datetime_prefix = self.get_str_datetime()
-        self.grad_cam = False
-        self.explanation_prepared = False
+        
+        self.grad_cam = None
+        self.lime = None
 
-    def __calculate_iters_count(self, train_config):
+        self.explain_methods_prepared = False
+
+    def _prepare_explain_methods(self):
+        explanation_config = self.explanation_config
+        if 'grad_cam' in explanation_config.keys():
+            if explanation_config['grad_cam'] == True:
+                self.grad_cam = GradCam(explanation_config, self)
+            else:
+                value = explanation_config['grad_cam']
+                raise XAIConfigException(f'Unknown parameter \'grad_cam\' in explanation_config : {value}')
+        if 'lime' in explanation_config.keys():
+            if explanation_config['lime'] == True:
+                self.grad_cam = LIME(explanation_config, self)
+            else:
+                value = explanation_config['lime']
+                raise XAIConfigException(f'Unknown parameter \'lime\' in explanation_config : {value}')
+        self.explain_methods_prepared = True
+
+    def _calculate_iters_count(self, train_config):
         discr_iters = train_config['discr_per_gener_iters']
         gen_iters = 1
         if type(discr_iters) == float:
@@ -71,53 +88,106 @@ class GAN:
             discr_iters = 1
         return discr_iters, gen_iters
 
-    def __save_models(self, epoch):
+    def save_gan(self, epoch='final'):
         result_dir = self.generation_config['result_dir']
-        models_dir = os.path.join(result_dir, self.datetime_prefix, 'model')
+        models_dir = os.path.join(result_dir, 'model')
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
         torch.save(self.generator, os.path.join(models_dir, f'generator_{epoch}_epoch.pt'))
         torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{epoch}_epoch.pt'))
 
-    def __save_images(self, images, content_type_name):
-        result_dir = self.generation_config['result_dir']
-        images_dir = os.path.join(result_dir, self.datetime_prefix, content_type_name)
+    def _save_images(self, images, result_dir, content_type_name):
+        images_dir = os.path.join(result_dir, content_type_name)
         if not os.path.exists(images_dir):
             os.makedirs(images_dir)
         for idx, image in enumerate(images):
             save_image(image, os.path.join(images_dir, f'{idx}.png'))
         return images_dir
                 
-    def clear_result_dir(self):
-        result_dir = self.generation_config['result_dir']
+    def clear_result_dir(self, generation_config):
+        result_dir = generation_config['result_dir']
         if os.path.exists(result_dir):
             shutil.rmtree(result_dir)
         os.makedirs(result_dir)
 
-    def train(self, train_config):
-        if not self.explanation_prepared:
-            self.__prepare_explanation()
-            self.explanation_prepared = True
-        base_batch_size = train_config['batch_size']
-        self.discriminator.apply(discriminator_init)
+    def _check_for_key(self, generation_config, key, value=None):
+        if value is None:
+            if generation_config is not None and key in generation_config.keys():
+                return generation_config[key]
+            else:
+                return None
+        else:
+            if generation_config is not None and key in generation_config.keys() and generation_config[key] == value:
+                return True
+            else:
+                return False
+
+    def _print_summary(self, generator_config, discriminator_config):
         if self.verbose:
             print('### Generator summary')
-            print((1,) + self.generator_config['z_shape'])
-            summary(self.generator, self.generator_config['z_shape'])
+            summary(generator_config['model'], generator_config['z_shape'])
             print('### Discriminator summary')
-            summary(self.discriminator, self.discriminator_config['input_shape'])
-        torch.set_printoptions(profile="full")
-        train_dataloader = torch.utils.data.DataLoader(train_config['trainset'], batch_size=base_batch_size, shuffle=True, num_workers=train_config['workers'])
-        test_dataloader = torch.utils.data.DataLoader(train_config['testset'], batch_size=base_batch_size, shuffle=True, num_workers=train_config['workers'])
-        criterion = self.discriminator_config['criterion']
-        discr_iters, gen_iters = self.__calculate_iters_count(train_config)
-        were_examples_saved = False
-        for epoch in range(train_config['epochs']):
-            if epoch != 0 and epoch % int(train_config['iterations_between_saves']) == 0:
-                self.generate(postfix=f'generated_epoch_{epoch}')
-                # self.__save_models(epoch)
-            print('Epoch:', epoch)
+            summary(discriminator_config['model'], discriminator_config['input_shape'])
+
+    def _save_examples(self, samples_number, data, postfix, result_dir):
+        if isinstance(torch.Tensor, type(data)):
+            sample_indices = RandomSampler(range(samples_number))
+            sampled_data = train_data[sample_indices]
+            batch_generator = create_tensor_batch_generator(data, sample_indices)
+        else:
+            train_dataloader = torch.utils.data.DataLoader(data, batch_size=samples_number, shuffle=True)
             batch_generator = create_batch_generator(train_dataloader)
+        counter = 0
+        while counter < samples_number:
+            indices, (images_batch, _) = next(batch_generator)
+            self._save_images(images_batch, result_dir, postfix)
+            counter += images_batch.shape[0]
+
+    def train(self, train_config, generation_config=None):
+        if not self.explain_methods_prepared:
+            self._prepare_explain_methods()
+        
+        if self._check_for_key(generation_config, 'result_dir'):
+            result_dir = generation_config['result_dir']
+        else:
+            result_dir = 'result_'+self.datetime_prefix
+
+        batch_size = train_config['batch_size']
+        train_data = train_config['train_dataset']
+        test_data = train_config['test_dataset']
+        
+        self._print_summary(self.generator_config, self.discriminator_config)
+        torch.set_printoptions(profile="full")
+
+        if isinstance(torch.Tensor, type(train_data)):
+            train_indices = BatchSampler(RandomSampler(range(train_data.shape[0])), batch_size=batch_size, drop_last=False)
+            test_indices = BatchSampler(RandomSampler(range(test_data.shape[0])), batch_size=batch_size, drop_last=False)
+        else:
+            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True, num_workers=train_config['workers'])
+        # test_dataloader = torch.utils.data.DataLoader(train_config['testset'], batch_size=batch_size, shuffle=True, num_workers=train_config['workers'])
+        criterion = self.discriminator_config['criterion']
+        
+        discr_iters, gen_iters = self._calculate_iters_count(train_config)
+
+        # Save examples of the data is needed
+        if self._check_for_key(generation_config, 'save_examples', True):
+            samples_number = generation_config['samples_number']
+            self._save_examples(samples_number, train_data, 'train_data_example', result_dir)
+            self._save_examples(samples_number, test_data, 'test_data_example', result_dir)
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        max_epochs = train_config['epochs']
+        progress_bar_epoch = tqdm(range(max_epochs))
+        for epoch in range(max_epochs):
+            progress_bar_epoch.set_description(f'# Training. Processing {epoch+1} epoch')
+            if generation_config is not None and epoch != 0 and epoch % int(train_config['iterations_between_saves']) == 0:
+                self.generate('epoch_'+str(epoch), generation_config)
+            if isinstance(torch.Tensor, type(train_data)):
+                train_labels = train_config['train_labels']
+                batch_generator = create_tensor_batch_generator(train_data, train_indices, train_labels)
+            else:
+                batch_generator = create_batch_generator(train_dataloader)
             continue_flag = True
             while continue_flag:
                 for discr_iter in range(discr_iters):
@@ -125,18 +195,11 @@ class GAN:
                     self.discriminator.zero_grad()
                     try:
                         indices, images = next(batch_generator)
-                        #print('Get batch', indices)
                     except StopIteration:
                         continue_flag = False
                         break
                     device_data = images[0].to(self.device)
                     batch_size = device_data.size(0)
-
-                    # Save examples of dataset
-                    result_dir = self.generation_config['result_dir']
-                    if self.verbose and self.generation_config is not None and not were_examples_saved:
-                        self.__save_images(device_data, 'data')
-                        were_examples_saved = True
 
                     # Prepare fake data
                     noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
@@ -147,8 +210,8 @@ class GAN:
                     data = torch.cat((device_data, generator_out))
 
                     # Prepare labels                
-                    label_real = torch.full((batch_size,), real_label, dtype=torch.float, device=self.device)
-                    label_fake = torch.full((batch_size,), fake_label, dtype=torch.float, device=self.device)
+                    label_real = torch.full((batch_size,), real_label, dtype=self.dtype, device=self.device)
+                    label_fake = torch.full((batch_size,), fake_label, dtype=self.dtype, device=self.device)
                     label = torch.cat((label_real, label_fake))
 
                     # Calculate predictions of discriminator and update discriminator's weights by real and fake data
@@ -157,17 +220,15 @@ class GAN:
                     err_discriminant_real.backward()
                     
                     self.discriminator_optimizer.step()
-                    #print('Prefinal discr')
                     
                     del device_data, noize_np, noize, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
                     gc.collect()
-                    torch.cuda.empty_cache() # TODO: if device is cpu?
-                    #print('Final discr')
+                    torch.cuda.empty_cache()
 
                 for gen_iter in range(gen_iters):
                     # Calculate generations and update generator's weights
                     self.generator.zero_grad()
-                    label = torch.full((batch_size,), real_label, dtype=torch.float, device=self.device) # fake labels are real for generator cost
+                    label = torch.full((batch_size,), real_label, dtype=self.dtype, device=self.device) # fake labels are real for generator cost
                     noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
                     noize = torch.from_numpy(noize_np).float().to(self.device)
                     generator_out = self.generator(noize)
@@ -177,179 +238,54 @@ class GAN:
                     self.generator_optimizer.step()
                     del label, noize_np, noize, generator_out, output, err_discriminator
                     gc.collect()
-                    torch.cuda.empty_cache() # TODO: if device is cpu?
+                    torch.cuda.empty_cache()
+            progress_bar_epoch.update(1)
 
-    def __find_target_conv_layer(self, grad_cam_layer_number):
-        conv_counter = 0
-        for name, module in self.discriminator.named_modules():
-            #print(module)
-            #print(type(module))
-            #print('CHECK')
-            if isinstance(module, torch.nn.modules.conv.Conv2d):
-                #print('INSIDE IF')
-                #print('@@@ SEARCHING SHAPE:', module.weight.grad.shape)
-                grad_cam_target_module = module
-                grad_cam_target_module_name = name
-                if conv_counter == grad_cam_layer_number:
-                    #print('## conv_counter', conv_counter)
-                    return grad_cam_target_module, grad_cam_target_module_name
-                conv_counter += 1
-            #print('*' * 50)
-        if conv_counter == 0:
-            raise GanException('No conv layers in network')
-        if grad_cam_layer_number != -1 and grad_cam_layer_number != conv_counter:
-            raise GanException(f'Unexpected error in __find_target_conv_layer(). grad_cam_layer_number:{grad_cam_layer_number}, conv_counter:{conv_counter}')
-        #print('## final conv_counter (+1)', conv_counter)
-        return grad_cam_target_module, grad_cam_target_module_name
+    def generate(self, postfix, generation_config):
+        if not self.explain_methods_prepared:
+            self._prepare_explain_methods()
+            
+        if self._check_for_key(generation_config, 'result_dir'):
+            result_dir = generation_config['result_dir']
+        else:
+            result_dir = 'result_'+self.datetime_prefix
+        result_dir = os.path.join(result_dir, postfix)
 
-    def __hook_fabric(self, storage, key):
-        def __hook_fn(self, input, output):
-            # print('--', module)
-            if not isinstance(output, torch.Tensor):
-                GanException(f"Error with output tensor. Type: {type(output)}")
-            # input  = (o.detach() for o in input ) if is_listy(input ) else input.detach()
-            output = output.detach()
-            storage[key] = output
-        return __hook_fn
-
-    def __prepare_forward_hooks(self, model, model_name):
-        if not hasattr(self, 'hooks'):
-            self.hooks = {}
-        self.hooks[model_name] = {}
-        for name, module in model.named_modules():
-            module.register_forward_hook(self.__hook_fabric(self.hooks[model_name], name))
-        # print(self.hooks)
-        # so
-
-    def __get_module_by_name(self, model, name):
-        return model.named_modules()[name]
-
-    def __prepare_explanation(self):
-        explanation_config = self.explanation_config
-        print('@@@', type(self.discriminator.named_modules()))
-        if 'grad_cam' in explanation_config.keys() and explanation_config['grad_cam'] == True:
-            self.__prepare_forward_hooks(self.discriminator, 'discriminator')
-            self.grad_cam = True
-            if 'grad_cam_layer_name' in explanation_config.keys():
-                self.grad_cam_target_module = self.__get_module_by_name(self.discriminator, explanation_config['grad_cam_layer_name'])
-                self.grad_cam_target_module_name = explanation_config['grad_cam_layer_name']
-            else:
-                if 'grad_cam_layer_number' in explanation_config.keys():
-                    self.grad_cam_layer_number = explanation_config['grad_cam_layer_number']
-                else:
-                    self.grad_cam_layer_number = -1
-                self.grad_cam_target_module, self.grad_cam_target_module_name = self.__find_target_conv_layer(self.grad_cam_layer_number)
-        self.explanation_prepared = True
-    
-    def __apply_heatmap(self, generated, heatmap, net_value):
-        heatmap = cv2.resize(heatmap.cpu().numpy(), (generated.shape[1], generated.shape[2]))
-        heatmap = np.uint8(255 * heatmap)
-        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-        #
-        #print(heatmap.shape)
-        
-        #print(heatmap[0][0])
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        #print(heatmap[0][0])
-        heatmap = heatmap.astype(float)
-        heatmap /= 255.
-        #print(heatmap)
-        #er
-
-        new_dim = generated.shape[0]
-        heatmap = torch.from_numpy(heatmap).to(self.device)
-        # heatmap = heatmap.view(heatmap.shape[0], heatmap.shape[1], 1).expand(heatmap.shape[0], heatmap.shape[1], new_dim) #.expand(-1, -1, generated.shape[0])
-        heatmap = torch.permute(heatmap, (2, 0, 1))
-        # print(heatmap.shape)
-        #er
-        if generated.shape[0] == 1:
-            generated = generated.expand(3, generated.shape[1], generated.shape[2])
-        #generated = generated.cpu().numpy()
-        #heatmap = heatmap.cpu().numpy()
-        #print('@@1', generated.shape)
-        #print('@@2', heatmap.shape)
-        
-        #print(heatmap)
-        #er
-        #heatmap = cv2.resize(heatmap, (generated.shape[0], generated.shape[1], new_dim))
-        #print('^^^', type(heatmap))
-        
-        # heatmap_expanded_list = []
-        # for channel in range(generated.shape[0]):
-        #     heatmap_expanded_list.append(heatmap)
-        #heatmap = np.array(heatmap_expanded_list)
-        #print('@@3', heatmap.shape)
-
-        #heatmap = np.uint8(255 * heatmap)
-        superimposed_img = heatmap * 0.5 * net_value + generated
-        mx = torch.max(superimposed_img)
-        if abs(mx) > 1e-6:
-            superimposed_img /= mx
-        return superimposed_img
-
-    def generate(self, postfix):
-        if not self.explanation_prepared:
-            self.__prepare_explanation()
-            self.explanation_prepared = True
-        batch_size = 1 # TODO if not 1 need changes in appending to generated_set            
+        batch_size = generation_config['batch_size']
         generated_set = []
+        
         if self.grad_cam:
             grad_cam_real = []
             grad_cam_fake = []
-            grad_cam_prob = {}
+            grad_cam_prob_real = {}
+            grad_cam_prob_fake = {}
 
-        result_dir = self.generation_config['result_dir']
-        for sample_number in range(self.generation_config['samples_number']):
+        samples_number = generation_config['samples_number']
+        samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
+
+        for sample_idx, batch_indices in enumerate(samples_indices): 
             noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
             noize = torch.from_numpy(noize_np).float().to(self.device)
             out = self.generator(noize)
-            generated_set.append(out)
-            label_map = {}
-            if self.grad_cam:
-                grad_cam_out = out.detach().clone()
-                criterion = self.discriminator_config['criterion']
-                discr_out = self.discriminator(grad_cam_out).view(-1)
-                
-                for label_value, label_postfix in [(1., 'real'), [0., 'fake']]:
-                    self.discriminator.zero_grad()
-                    label = torch.full((batch_size,), label_value, dtype=torch.float, device=self.device)
-                    err_discriminant = criterion(discr_out, label)
-                    err_discriminant.backward(retain_graph=True)
-                    grad = self.grad_cam_target_module.weight.grad
-                    pooled_gradients = torch.mean(grad, dim=[1, 2, 3])
-                    activations_copy = self.hooks['discriminator'][self.grad_cam_target_module_name].detach().clone()
-                    for idx in range(activations_copy.shape[1]):
-                        activations_copy[:, idx, :, :] *= pooled_gradients[idx]
-                    grad_cam_heatmap = torch.mean(activations_copy, dim=1).squeeze()
-                    relu = torch.nn.ReLU()
-                    grad_cam_heatmap = relu(grad_cam_heatmap)
-                    max_val = torch.max(grad_cam_heatmap).item()
-                    # print('@@ MAX VAL', max_val)
-                    if abs(max_val) > 1e-6:
-                        grad_cam_heatmap /= max_val
-                    
-                    net_value = discr_out[0].item()
-                    grad_cam_prob[sample_number] = f'{net_value:.3f}'
-                    # print('### Label:', label_value, ' SampleIdx:', sample_number)
-                    # print(grad_cam_heatmap)
-                    # print('=' * 40)
-                    if label_postfix == 'real':
-                        applied_heatmap = self.__apply_heatmap(grad_cam_out[0], grad_cam_heatmap, net_value)
-                        grad_cam_real.append(applied_heatmap)
-                    else:
-                        applied_heatmap = self.__apply_heatmap(grad_cam_out[0], grad_cam_heatmap, 1 - net_value)
-                        grad_cam_fake.append(applied_heatmap)
+            for subout in out:
+                generated_set.append(subout)
+            if self.grad_cam is not None:
+                for idx, subout in enumerate(out):
+                    grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = self.grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
+                    grad_cam_real.append(grad_cam_real_local)
+                    grad_cam_fake.append(grad_cam_fake_local)
+                    grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
+                    grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
 
-            del noize_np, noize, out
+            del noize_np, noize, out, subout
             gc.collect()
-            torch.cuda.empty_cache() # TODO: if device is cpu?
-        self.__save_images(generated_set, postfix)
+            torch.cuda.empty_cache()
+
+        self._save_images(generated_set, result_dir, 'generated')
         if self.grad_cam:
-            images_dir = self.__save_images(grad_cam_real, postfix+'_grad_cam_real')
+            images_dir = self._save_images(grad_cam_real, result_dir, 'grad_cam_real')
             with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
-                f.write(json.dumps(grad_cam_prob, indent=4, sort_keys=True))
-            images_dir = self.__save_images(grad_cam_fake, postfix+'_grad_cam_fake')
-            with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
-                f.write(json.dumps(grad_cam_prob, indent=4, sort_keys=True))
-        # er
-            
+                f.write(json.dumps(grad_cam_prob_real, indent=4, sort_keys=True))
+            images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake')
+            with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
+                f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))

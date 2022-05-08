@@ -28,7 +28,7 @@ setup(
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10'
     ],
-    packages=['xgan', 'xgan.models', 'xgan.models'],
+    packages=['xgan', 'xgan.models', 'xgan.xai', 'xgan.utils'],
     python_requires='>=3.4',
     # extras_require={
     #     'visualization': ['pyglet'],
