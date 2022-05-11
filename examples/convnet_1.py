@@ -1,8 +1,10 @@
 import torch
 import torch.optim as optim
 import torchvision
+
 from xgan.models import Convnet1
 from xgan import GAN
+from xgan.xai import LimeRandomForest
 
 def main():
     data_root = '_datasets'
@@ -20,21 +22,30 @@ def main():
         'z_shape': (100,), 
         'output_shape': (1, 28, 28) # CHW
     }
+    generator_config['model'] = Convnet1().generator(generator_config)
+
     discriminator_config = {
         'input_shape': (1, 28, 28),
         'criterion': criterion
     }
+    discriminator_config['model'] = Convnet1().discriminator(discriminator_config)
+    
     explanation_config = {
-        'grad_cam': True
+        # 'grad_cam': True,
+        'lime': {
+            'model' : LimeRandomForest(n_estimators=10, max_depth=4),
+            'samples_to_explain': 1000,
+            'features' : ['explain_model']
+        }
     }
     generation_config = {
-        'samples_number': 12,
+        'samples_number': 2,
         'batch_size' : 2,
         'save_examples' : True,
         'result_dir': result_dir
     }
-    generator_config['model'] = Convnet1().generator(generator_config)
-    discriminator_config['model'] = Convnet1().discriminator(discriminator_config)
+    
+    
     generator_config['optimizer'] = optim.Adam(generator_config['model'].parameters(), lr=gan_lr, betas=(beta1, 0.999))
     discriminator_config['optimizer'] = optim.Adam(discriminator_config['model'].parameters(), lr=gan_lr, betas=(beta1, 0.999))
 
@@ -42,7 +53,7 @@ def main():
     gan = GAN(device, generator_config, discriminator_config, verbose=True, explanation_config=explanation_config)
     gan.clear_result_dir(generation_config)
     train_config = {
-        'epochs' : 10,
+        'epochs' : 200,
         'discr_per_gener_iters' : 3,
         'iterations_between_saves': 1,
         'batch_size': 200,
@@ -53,7 +64,7 @@ def main():
     
     gan.train(train_config, generation_config)
     
-    gan.generate('result', generation_config)
+    gan.generate('result', generation_config, train_config=train_config)
     # gan.get_explaination_for_sample(x)
 
 if __name__ == '__main__':

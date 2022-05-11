@@ -17,7 +17,7 @@ from torchvision.utils import save_image
 from torchsummary import summary
 
 from xgan.xai import GradCam
-from xgan.xai import LIME
+from xgan.utils import check_for_key
 
 real_label = 1.
 fake_label = 0.
@@ -72,11 +72,7 @@ class GAN:
                 value = explanation_config['grad_cam']
                 raise XAIConfigException(f'Unknown parameter \'grad_cam\' in explanation_config : {value}')
         if 'lime' in explanation_config.keys():
-            if explanation_config['lime'] == True:
-                self.grad_cam = LIME(explanation_config, self)
-            else:
-                value = explanation_config['lime']
-                raise XAIConfigException(f'Unknown parameter \'lime\' in explanation_config : {value}')
+            self.lime = explanation_config['lime']['model']
         self.explain_methods_prepared = True
 
     def _calculate_iters_count(self, train_config):
@@ -88,20 +84,24 @@ class GAN:
             discr_iters = 1
         return discr_iters, gen_iters
 
-    def save_gan(self, epoch='final'):
+    def save_gan(self, epoch='final'): # TODO
         result_dir = self.generation_config['result_dir']
         models_dir = os.path.join(result_dir, 'model')
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir)
+        # if not os.path.exists(models_dir):
+        #     os.makedirs(models_dir)
         torch.save(self.generator, os.path.join(models_dir, f'generator_{epoch}_epoch.pt'))
         torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{epoch}_epoch.pt'))
 
-    def _save_images(self, images, result_dir, content_type_name):
-        images_dir = os.path.join(result_dir, content_type_name)
+    def _save_images(self, images, images_dir, content_type_name):
         if not os.path.exists(images_dir):
             os.makedirs(images_dir)
+        if isinstance(torch.Tensor, type(images)):
+            field_size = len(str(images.shape[0]))
+        else:
+            field_size = len(str(len(images)))
         for idx, image in enumerate(images):
-            save_image(image, os.path.join(images_dir, f'{idx}.png'))
+            formatted_idx_value = '0' * (field_size - len(str(idx))) + str(idx)
+            save_image(image, os.path.join(images_dir, f'{formatted_idx_value}_{content_type_name}.png'))
         return images_dir
                 
     def clear_result_dir(self, generation_config):
@@ -109,18 +109,6 @@ class GAN:
         if os.path.exists(result_dir):
             shutil.rmtree(result_dir)
         os.makedirs(result_dir)
-
-    def _check_for_key(self, generation_config, key, value=None):
-        if value is None:
-            if generation_config is not None and key in generation_config.keys():
-                return generation_config[key]
-            else:
-                return None
-        else:
-            if generation_config is not None and key in generation_config.keys() and generation_config[key] == value:
-                return True
-            else:
-                return False
 
     def _print_summary(self, generator_config, discriminator_config):
         if self.verbose:
@@ -138,6 +126,7 @@ class GAN:
             train_dataloader = torch.utils.data.DataLoader(data, batch_size=samples_number, shuffle=True)
             batch_generator = create_batch_generator(train_dataloader)
         counter = 0
+        result_dir = os.path.join(result_dir, postfix)
         while counter < samples_number:
             indices, (images_batch, _) = next(batch_generator)
             self._save_images(images_batch, result_dir, postfix)
@@ -147,7 +136,7 @@ class GAN:
         if not self.explain_methods_prepared:
             self._prepare_explain_methods()
         
-        if self._check_for_key(generation_config, 'result_dir'):
+        if check_for_key(generation_config, 'result_dir'):
             result_dir = generation_config['result_dir']
         else:
             result_dir = 'result_'+self.datetime_prefix
@@ -163,14 +152,14 @@ class GAN:
             train_indices = BatchSampler(RandomSampler(range(train_data.shape[0])), batch_size=batch_size, drop_last=False)
             test_indices = BatchSampler(RandomSampler(range(test_data.shape[0])), batch_size=batch_size, drop_last=False)
         else:
-            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True, num_workers=train_config['workers'])
-        # test_dataloader = torch.utils.data.DataLoader(train_config['testset'], batch_size=batch_size, shuffle=True, num_workers=train_config['workers'])
+            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True)
+        # test_dataloader = torch.utils.data.DataLoader(train_config['testset'], batch_size=batch_size, shuffle=True)
         criterion = self.discriminator_config['criterion']
         
         discr_iters, gen_iters = self._calculate_iters_count(train_config)
 
         # Save examples of the data is needed
-        if self._check_for_key(generation_config, 'save_examples', True):
+        if check_for_key(generation_config, 'save_examples', True):
             samples_number = generation_config['samples_number']
             self._save_examples(samples_number, train_data, 'train_data_example', result_dir)
             self._save_examples(samples_number, test_data, 'test_data_example', result_dir)
@@ -178,11 +167,13 @@ class GAN:
             torch.cuda.empty_cache()
         
         max_epochs = train_config['epochs']
+        max_epochs_field_size = len(str(max_epochs))
         progress_bar_epoch = tqdm(range(max_epochs))
         for epoch in range(max_epochs):
+            formatted_epoch_value = '0' * (max_epochs_field_size - len(str(epoch))) + str(epoch)
             progress_bar_epoch.set_description(f'# Training. Processing {epoch+1} epoch')
             if generation_config is not None and epoch != 0 and epoch % int(train_config['iterations_between_saves']) == 0:
-                self.generate('epoch_'+str(epoch), generation_config)
+                self.generate(f'epoch_{formatted_epoch_value}', generation_config, train_config=train_config)
             if isinstance(torch.Tensor, type(train_data)):
                 train_labels = train_config['train_labels']
                 batch_generator = create_tensor_batch_generator(train_data, train_indices, train_labels)
@@ -241,15 +232,16 @@ class GAN:
                     torch.cuda.empty_cache()
             progress_bar_epoch.update(1)
 
-    def generate(self, postfix, generation_config):
+    def generate(self, postfix, generation_config, train_config=None):
         if not self.explain_methods_prepared:
             self._prepare_explain_methods()
             
-        if self._check_for_key(generation_config, 'result_dir'):
+        if check_for_key(generation_config, 'result_dir'):
             result_dir = generation_config['result_dir']
         else:
             result_dir = 'result_'+self.datetime_prefix
         result_dir = os.path.join(result_dir, postfix)
+        os.makedirs(result_dir)
 
         batch_size = generation_config['batch_size']
         generated_set = []
@@ -263,6 +255,7 @@ class GAN:
         samples_number = generation_config['samples_number']
         samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
 
+        max_field_size = len(str(samples_number))
         for sample_idx, batch_indices in enumerate(samples_indices): 
             noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
             noize = torch.from_numpy(noize_np).float().to(self.device)
@@ -276,6 +269,21 @@ class GAN:
                     grad_cam_fake.append(grad_cam_fake_local)
                     grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
                     grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
+            if self.lime is not None:
+                with torch.no_grad():
+                    for idx, subout in enumerate(out):
+                        formatted_idx = '0' * (max_field_size - len(str(idx))) + str(idx)
+                        train_data = train_config['train_dataset']
+                        test_data = train_config['test_dataset']
+                        if isinstance(torch.Tensor, type(train_data)):
+                            train_labels = train_config['train_labels']
+                            train_indices = BatchSampler(RandomSampler(range(train_data.shape[0])), batch_size=batch_size, drop_last=False)
+                            test_indices = BatchSampler(RandomSampler(range(test_data.shape[0])), batch_size=batch_size, drop_last=False)
+                            batch_generator = create_tensor_batch_generator(train_data, train_indices, train_labels)
+                        else:
+                            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True)
+                            batch_generator = create_batch_generator(train_dataloader)
+                        self.lime.explain_sample(subout, formatted_idx, batch_generator, result_dir, self.explanation_config, generation_config)
 
             del noize_np, noize, out, subout
             gc.collect()
