@@ -11,29 +11,16 @@ from tqdm.auto import tqdm
 import json
 
 import torch
-from torch.utils.data import BatchSampler, RandomSampler, SequentialSampler
+from torch.utils.data import BatchSampler, SequentialSampler
 
 from torchvision.utils import save_image
 from torchsummary import summary
 
 from xgan.xai import GradCam
-from xgan.utils import check_for_key
+from xgan.utils import check_for_key, prepare_batches, gan_labels
 
 real_label = 1.
 fake_label = 0.
-
-def create_batch_generator(data_loader):
-    for index, (data, target) in enumerate(data_loader):
-        yield index, (data, target)
-
-def create_tensor_batch_generator(data_tensor, indices, data_labels=None):
-    for batch_idx, samples_indices in enumerate(indices):
-        batch_data = data_tensor[samples_indices]
-        if data_labels is None:
-            yield batch_idx, (batch_data, 0)
-        else:
-            batch_labels = data_labels[samples_indices]
-            yield batch_idx, (batch_data, batch_labels)
 
 class GAN:
     def get_str_datetime(self):
@@ -92,15 +79,11 @@ class GAN:
         torch.save(self.generator, os.path.join(models_dir, f'generator_{epoch}_epoch.pt'))
         torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{epoch}_epoch.pt'))
 
-    def _save_images(self, images, images_dir, content_type_name):
+    def _save_images(self, images, images_dir, content_type_name, samples_number, start_index=0):
         if not os.path.exists(images_dir):
             os.makedirs(images_dir)
-        if isinstance(torch.Tensor, type(images)):
-            field_size = len(str(images.shape[0]))
-        else:
-            field_size = len(str(len(images)))
         for idx, image in enumerate(images):
-            formatted_idx_value = '0' * (field_size - len(str(idx))) + str(idx)
+            formatted_idx_value = '0' * (len(str(samples_number)) - len(str(start_index + idx))) + str(start_index + idx)
             save_image(image, os.path.join(images_dir, f'{formatted_idx_value}_{content_type_name}.png'))
         return images_dir
                 
@@ -117,20 +100,16 @@ class GAN:
             print('### Discriminator summary')
             summary(discriminator_config['model'], discriminator_config['input_shape'])
 
-    def _save_examples(self, samples_number, data, postfix, result_dir):
-        if isinstance(torch.Tensor, type(data)):
-            sample_indices = RandomSampler(range(samples_number))
-            sampled_data = train_data[sample_indices]
-            batch_generator = create_tensor_batch_generator(data, sample_indices)
-        else:
-            train_dataloader = torch.utils.data.DataLoader(data, batch_size=samples_number, shuffle=True)
-            batch_generator = create_batch_generator(train_dataloader)
-        counter = 0
+    def _save_examples(self, samples_number, data, postfix, result_dir, batch_size):
+        batch_generator = prepare_batches(data, None, batch_size)
         result_dir = os.path.join(result_dir, postfix)
-        while counter < samples_number:
-            indices, (images_batch, _) = next(batch_generator)
-            self._save_images(images_batch, result_dir, postfix)
-            counter += images_batch.shape[0]
+        remained = samples_number
+        for batch_idx, (batch_data, _) in batch_generator:
+            if remained == 0:
+                break
+            reduced_batch_data = batch_data[:remained]
+            self._save_images(reduced_batch_data, result_dir, postfix, samples_number, samples_number - remained)
+            remained -= batch_size
 
     def train(self, train_config, generation_config=None):
         if not self.explain_methods_prepared:
@@ -141,31 +120,27 @@ class GAN:
         else:
             result_dir = 'result_'+self.datetime_prefix
 
-        batch_size = train_config['batch_size']
         train_data = train_config['train_dataset']
+        train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
         test_data = train_config['test_dataset']
+        test_labels = train_config['test_labels'] if 'test_labels' in train_config.keys() and isinstance(test_data, torch.Tensor) else None
         
         self._print_summary(self.generator_config, self.discriminator_config)
         torch.set_printoptions(profile="full")
-
-        if isinstance(torch.Tensor, type(train_data)):
-            train_indices = BatchSampler(RandomSampler(range(train_data.shape[0])), batch_size=batch_size, drop_last=False)
-            test_indices = BatchSampler(RandomSampler(range(test_data.shape[0])), batch_size=batch_size, drop_last=False)
-        else:
-            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True)
-        # test_dataloader = torch.utils.data.DataLoader(train_config['testset'], batch_size=batch_size, shuffle=True)
         criterion = self.discriminator_config['criterion']
-        
+
         discr_iters, gen_iters = self._calculate_iters_count(train_config)
 
         # Save examples of the data is needed
         if check_for_key(generation_config, 'save_examples', True):
             samples_number = generation_config['samples_number']
-            self._save_examples(samples_number, train_data, 'train_data_example', result_dir)
-            self._save_examples(samples_number, test_data, 'test_data_example', result_dir)
+            batch_size = generation_config['batch_size']
+            self._save_examples(samples_number, train_data, 'train_data_example', result_dir, batch_size)
+            self._save_examples(samples_number, test_data, 'test_data_example', result_dir, batch_size)
             gc.collect()
             torch.cuda.empty_cache()
         
+        batch_size = train_config['batch_size']
         max_epochs = train_config['epochs']
         max_epochs_field_size = len(str(max_epochs))
         progress_bar_epoch = tqdm(range(max_epochs))
@@ -174,11 +149,7 @@ class GAN:
             progress_bar_epoch.set_description(f'# Training. Processing {epoch+1} epoch')
             if generation_config is not None and epoch != 0 and epoch % int(train_config['iterations_between_saves']) == 0:
                 self.generate(f'epoch_{formatted_epoch_value}', generation_config, train_config=train_config)
-            if isinstance(torch.Tensor, type(train_data)):
-                train_labels = train_config['train_labels']
-                batch_generator = create_tensor_batch_generator(train_data, train_indices, train_labels)
-            else:
-                batch_generator = create_batch_generator(train_dataloader)
+            batch_generator = prepare_batches(train_data, train_labels, batch_size)
             continue_flag = True
             while continue_flag:
                 for discr_iter in range(discr_iters):
@@ -193,9 +164,7 @@ class GAN:
                     batch_size = device_data.size(0)
 
                     # Prepare fake data
-                    noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
-                    noize = torch.from_numpy(noize_np).float().to(self.device) 
-                    generator_out = self.generator(noize).detach()
+                    generator_out = self._internal_generate(batch_size).detach()
 
                     # Concat data
                     data = torch.cat((device_data, generator_out))
@@ -212,7 +181,7 @@ class GAN:
                     
                     self.discriminator_optimizer.step()
                     
-                    del device_data, noize_np, noize, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
+                    del device_data, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
                     gc.collect()
                     torch.cuda.empty_cache()
 
@@ -220,17 +189,20 @@ class GAN:
                     # Calculate generations and update generator's weights
                     self.generator.zero_grad()
                     label = torch.full((batch_size,), real_label, dtype=self.dtype, device=self.device) # fake labels are real for generator cost
-                    noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
-                    noize = torch.from_numpy(noize_np).float().to(self.device)
-                    generator_out = self.generator(noize)
+                    generator_out = self._internal_generate(batch_size)
                     output = self.discriminator(generator_out).view(-1)
                     err_discriminator = criterion(output, label)
                     err_discriminator.backward()
                     self.generator_optimizer.step()
-                    del label, noize_np, noize, generator_out, output, err_discriminator
+                    del label, generator_out, output, err_discriminator
                     gc.collect()
                     torch.cuda.empty_cache()
             progress_bar_epoch.update(1)
+
+    def _internal_generate(self, batch_size):
+        noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
+        noize = torch.from_numpy(noize_np).float().to(self.device)
+        return self.generator(noize)
 
     def generate(self, postfix, generation_config, train_config=None):
         if not self.explain_methods_prepared:
@@ -254,46 +226,53 @@ class GAN:
 
         samples_number = generation_config['samples_number']
         samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
-
         max_field_size = len(str(samples_number))
-        for sample_idx, batch_indices in enumerate(samples_indices): 
-            noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
-            noize = torch.from_numpy(noize_np).float().to(self.device)
-            out = self.generator(noize)
+
+        for sample_idx, batch_indices in enumerate(samples_indices):
+            out = self._internal_generate(batch_size)
             for subout in out:
-                generated_set.append(subout)
+                generated_set.append(subout.detach())
             if self.grad_cam is not None:
                 for idx, subout in enumerate(out):
                     grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = self.grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
-                    grad_cam_real.append(grad_cam_real_local)
-                    grad_cam_fake.append(grad_cam_fake_local)
+                    grad_cam_real.append(grad_cam_real_local.detach())
+                    grad_cam_fake.append(grad_cam_fake_local.detach())
                     grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
                     grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
             if self.lime is not None:
                 with torch.no_grad():
+                    train_data = train_config['train_dataset']
+                    train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+                    generated_samples = self._internal_generate(self.explanation_config['lime']['samples_per_class'])
+                    real_batch_generator = prepare_batches(train_data, train_labels, batch_size)
+                    real_batches = []
+                    remained = self.explanation_config['lime']['samples_per_class']
+                    for batch_idx, (batch_data, _) in real_batch_generator:
+                        if remained == 0:
+                            break
+                        reduced_batch_data = batch_data[:remained].to(self.device)
+                        real_batches.append(reduced_batch_data)
+                        remained -= batch_size
+                    real_data = torch.cat(real_batches, dim=0)
+                    lime_data = torch.cat([generated_samples, real_data], dim=0)
+
+                    label_real = torch.full((self.explanation_config['lime']['samples_per_class'],), gan_labels['real'], dtype=self.dtype, device=self.device)
+                    label_fake = torch.full((self.explanation_config['lime']['samples_per_class'],), gan_labels['fake'], dtype=self.dtype, device=self.device)
+                    lime_label = torch.cat([label_fake, label_real], dim=0)
+
                     for idx, subout in enumerate(out):
                         formatted_idx = '0' * (max_field_size - len(str(idx))) + str(idx)
-                        train_data = train_config['train_dataset']
-                        test_data = train_config['test_dataset']
-                        if isinstance(torch.Tensor, type(train_data)):
-                            train_labels = train_config['train_labels']
-                            train_indices = BatchSampler(RandomSampler(range(train_data.shape[0])), batch_size=batch_size, drop_last=False)
-                            test_indices = BatchSampler(RandomSampler(range(test_data.shape[0])), batch_size=batch_size, drop_last=False)
-                            batch_generator = create_tensor_batch_generator(train_data, train_indices, train_labels)
-                        else:
-                            train_dataloader = torch.utils.data.DataLoader(train_config['train_dataset'], batch_size=batch_size, shuffle=True)
-                            batch_generator = create_batch_generator(train_dataloader)
-                        self.lime.explain_sample(subout, formatted_idx, batch_generator, result_dir, self.explanation_config, generation_config)
+                        self.lime.explain_sample(subout, lime_data, lime_label, formatted_idx, result_dir, self.explanation_config, generation_config)
 
-            del noize_np, noize, out, subout
+            del out, subout, lime_label, lime_data
             gc.collect()
             torch.cuda.empty_cache()
 
-        self._save_images(generated_set, result_dir, 'generated')
+        self._save_images(generated_set, result_dir, 'generated', len(generated_set))
         if self.grad_cam:
-            images_dir = self._save_images(grad_cam_real, result_dir, 'grad_cam_real')
+            images_dir = self._save_images(grad_cam_real, result_dir, 'grad_cam_real', len(grad_cam_real))
             with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
                 f.write(json.dumps(grad_cam_prob_real, indent=4, sort_keys=True))
-            images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake')
+            images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake', len(grad_cam_fake))
             with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
                 f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))

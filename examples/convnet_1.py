@@ -31,10 +31,10 @@ def main():
     discriminator_config['model'] = Convnet1().discriminator(discriminator_config)
     
     explanation_config = {
-        # 'grad_cam': True,
+        'grad_cam': True,
         'lime': {
             'model' : LimeRandomForest(n_estimators=10, max_depth=4),
-            'samples_to_explain': 1000,
+            'samples_per_class': 30000,
             'features' : ['explain_model']
         }
     }
