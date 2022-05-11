@@ -1,12 +1,10 @@
+from collections import OrderedDict
 from torch.utils.data import BatchSampler, RandomSampler
 import torch
 
 from .exception import XAIConfigException
 
-gan_labels = {
-    'real': 1.,
-    'fake': 0.
-}
+gan_labels = OrderedDict(sorted({ 'real': 1., 'fake': 0. }.items(), key=lambda x:x[1]))
 
 def check_for_key(config, key, value=None):
     if value is None:

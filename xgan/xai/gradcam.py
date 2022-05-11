@@ -43,7 +43,6 @@ class GradCam:
                 grad_cam_heatmap /= max_val
             
             net_value = discr_out[0].item()
-            # grad_cam_prob[sample_number] = f'{net_value:.3f}'
             if label_postfix == 'real':
                 real_prob = net_value
                 applied_heatmap = self._apply_heatmap(discr_input[0], grad_cam_heatmap, real_prob)

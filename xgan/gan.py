@@ -16,7 +16,7 @@ from torch.utils.data import BatchSampler, SequentialSampler
 from torchvision.utils import save_image
 from torchsummary import summary
 
-from xgan.xai import GradCam
+from xgan.xai import GradCam, LIME
 from xgan.utils import check_for_key, prepare_batches, gan_labels
 
 real_label = 1.
@@ -170,8 +170,8 @@ class GAN:
                     data = torch.cat((device_data, generator_out))
 
                     # Prepare labels                
-                    label_real = torch.full((batch_size,), real_label, dtype=self.dtype, device=self.device)
-                    label_fake = torch.full((batch_size,), fake_label, dtype=self.dtype, device=self.device)
+                    label_real = torch.full((batch_size,), gan_labels['real'], dtype=self.dtype, device=self.device)
+                    label_fake = torch.full((batch_size,), gan_labels['fake'], dtype=self.dtype, device=self.device)
                     label = torch.cat((label_real, label_fake))
 
                     # Calculate predictions of discriminator and update discriminator's weights by real and fake data
@@ -188,7 +188,7 @@ class GAN:
                 for gen_iter in range(gen_iters):
                     # Calculate generations and update generator's weights
                     self.generator.zero_grad()
-                    label = torch.full((batch_size,), real_label, dtype=self.dtype, device=self.device) # fake labels are real for generator cost
+                    label = torch.full((batch_size,), gan_labels['real'], dtype=self.dtype, device=self.device) # fake labels are real for generator cost
                     generator_out = self._internal_generate(batch_size)
                     output = self.discriminator(generator_out).view(-1)
                     err_discriminator = criterion(output, label)
@@ -229,11 +229,11 @@ class GAN:
         max_field_size = len(str(samples_number))
 
         for sample_idx, batch_indices in enumerate(samples_indices):
-            out = self._internal_generate(batch_size)
-            for subout in out:
+            generated_data = self._internal_generate(batch_size)
+            for subout in generated_data:
                 generated_set.append(subout.detach())
             if self.grad_cam is not None:
-                for idx, subout in enumerate(out):
+                for idx, subout in enumerate(generated_data):
                     grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = self.grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
                     grad_cam_real.append(grad_cam_real_local.detach())
                     grad_cam_fake.append(grad_cam_fake_local.detach())
@@ -243,28 +243,15 @@ class GAN:
                 with torch.no_grad():
                     train_data = train_config['train_dataset']
                     train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
-                    generated_samples = self._internal_generate(self.explanation_config['lime']['samples_per_class'])
-                    real_batch_generator = prepare_batches(train_data, train_labels, batch_size)
-                    real_batches = []
-                    remained = self.explanation_config['lime']['samples_per_class']
-                    for batch_idx, (batch_data, _) in real_batch_generator:
-                        if remained == 0:
-                            break
-                        reduced_batch_data = batch_data[:remained].to(self.device)
-                        real_batches.append(reduced_batch_data)
-                        remained -= batch_size
-                    real_data = torch.cat(real_batches, dim=0)
-                    lime_data = torch.cat([generated_samples, real_data], dim=0)
-
-                    label_real = torch.full((self.explanation_config['lime']['samples_per_class'],), gan_labels['real'], dtype=self.dtype, device=self.device)
-                    label_fake = torch.full((self.explanation_config['lime']['samples_per_class'],), gan_labels['fake'], dtype=self.dtype, device=self.device)
-                    lime_label = torch.cat([label_fake, label_real], dim=0)
-
-                    for idx, subout in enumerate(out):
+                    
+                    lime_helper = LIME(self, self.explanation_config['lime'])
+                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, train_labels, batch_size, generated_data)
+                    for idx, subout in enumerate(generated_data):
                         formatted_idx = '0' * (max_field_size - len(str(idx))) + str(idx)
-                        self.lime.explain_sample(subout, lime_data, lime_label, formatted_idx, result_dir, self.explanation_config, generation_config)
+                        weights = weights_batch[:, idx]
+                        self.lime.explain_sample(subout, X, y, weights, features, result_dir, formatted_idx, self.explanation_config, generation_config)
 
-            del out, subout, lime_label, lime_data
+            del generated_data, subout, X, y, weights_batch, features, lime_helper
             gc.collect()
             torch.cuda.empty_cache()
 

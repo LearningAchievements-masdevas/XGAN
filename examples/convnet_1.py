@@ -17,29 +17,30 @@ def main():
     gan_lr = 2e-4
     beta1 = 0.5
     criterion = torch.nn.BCELoss()
+    convnet = Convnet1()
 
     generator_config = {
         'z_shape': (100,), 
         'output_shape': (1, 28, 28) # CHW
     }
-    generator_config['model'] = Convnet1().generator(generator_config)
+    generator_config['model'] = convnet.generator(generator_config)
 
     discriminator_config = {
         'input_shape': (1, 28, 28),
         'criterion': criterion
     }
-    discriminator_config['model'] = Convnet1().discriminator(discriminator_config)
+    discriminator_config['model'] = convnet.discriminator(discriminator_config)
     
     explanation_config = {
         'grad_cam': True,
         'lime': {
             'model' : LimeRandomForest(n_estimators=10, max_depth=4),
-            'samples_per_class': 30000,
+            'samples_per_class': 10000,
             'features' : ['explain_model']
         }
     }
     generation_config = {
-        'samples_number': 2,
+        'samples_number': 3,
         'batch_size' : 2,
         'save_examples' : True,
         'result_dir': result_dir
