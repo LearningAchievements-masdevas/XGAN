@@ -35,10 +35,13 @@ def _create_tensor_batch_generator(data, labels, indices):
             yield batch_idx, (batch_data, batch_labels)
 
 def prepare_batches(data, labels, batch_size):
-    if isinstance(torch.Tensor, type(data)):
+    print('***', type(data))
+    if isinstance(data, torch.Tensor):
+        print('#1')
         indices = BatchSampler(RandomSampler(range(data.shape[0])), batch_size=batch_size, drop_last=False)
         batch_generator = _create_tensor_batch_generator(data, labels, indices)
     else:
+        print('#2')
         dataloader = torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=True)
         batch_generator = _create_batch_generator(dataloader)
     return batch_generator

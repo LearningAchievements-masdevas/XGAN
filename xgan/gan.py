@@ -115,8 +115,8 @@ class GAN:
             print('### Discriminator summary')
             summary(self.discriminator, self.discriminator_config['input_shape'])
 
-    def _save_examples(self, samples_number, data, postfix, result_dir, batch_size):
-        batch_generator = prepare_batches(data, None, batch_size)
+    def _save_examples(self, samples_number, data, labels, postfix, result_dir, batch_size):
+        batch_generator = prepare_batches(data, labels, batch_size)
         result_dir = os.path.join(result_dir, postfix)
         remained = samples_number
         for batch_idx, (batch_data, _) in batch_generator:
@@ -150,8 +150,8 @@ class GAN:
         if check_for_key(generation_config, 'save_examples', True):
             samples_number = generation_config['samples_number']
             batch_size = generation_config['batch_size']
-            self._save_examples(samples_number, train_data, 'train_data_example', result_dir, batch_size)
-            self._save_examples(samples_number, test_data, 'test_data_example', result_dir, batch_size)
+            self._save_examples(samples_number, train_data, train_labels, 'train_data_example', result_dir, batch_size)
+            self._save_examples(samples_number, test_data, test_labels, 'test_data_example', result_dir, batch_size)
             gc.collect()
             torch.cuda.empty_cache()
         

@@ -27,8 +27,10 @@ def convert_data_to_tensor(dataset, dtype):
     for _, (batch_data, batch_labels) in batches:
         X_list.append(batch_data)
         y_list.append(batch_labels)
-    X = torch.stack(X_list, device=cpu, dtype=dtype)
-    y = torch.stack(y_list, device=cpu, dtype=dtype)
+    X = torch.cat(X_list).to(device=cpu, dtype=dtype)
+    y = torch.cat(y_list).to(device=cpu, dtype=dtype)
+    print(X.shape)
+    print(y.shape)
     return X, y
 
 def main():
@@ -42,6 +44,8 @@ def main():
     train_X, train_y = convert_data_to_tensor(trainset, dtype)
     testset = torchvision.datasets.MNIST(data_root, train=False, download=True, transform=transform)
     test_X, test_y = convert_data_to_tensor(testset, dtype)
+    gc.collect()
+    torch.cuda.empty_cache()
     gan_lr = 0.0002
     criterion = torch.nn.BCELoss()
     convnet = Convnet1()
@@ -104,8 +108,10 @@ def main():
         'discr_per_gener_iters' : 3,
         'iterations_between_saves': 10,
         'batch_size': 1024,
-        'train_dataset': trainset,
-        'test_dataset': testset
+        'train_dataset': train_X,
+        'train_labels': train_y,
+        'test_dataset': test_X,
+        'test_labels': test_y,
     }
     
     gan.train(train_config, generation_config)
