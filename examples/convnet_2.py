@@ -8,7 +8,7 @@ from xgan.xai import LimeRandomForest
 
 def main():
     data_root = '_datasets'
-    result_dir = '_convnet_1'
+    result_dir = '_convnet_2'
     transform=torchvision.transforms.Compose([
         torchvision.transforms.ToTensor()
     ])
@@ -32,15 +32,15 @@ def main():
     discriminator_config['model'] = convnet.discriminator(discriminator_config)
     
     explanation_config = {
-        'grad_cam': True,
-        'lime': {
-            'model' : LimeRandomForest(n_estimators=10, max_depth=4),
-            'samples_per_class': 30000,
-            'features' : ['explain_model']
-        }
+        # 'grad_cam': True,
+        # 'lime': {
+        #     'model' : LimeRandomForest(n_estimators=10, max_depth=4),
+        #     'samples_per_class': 10000,
+        #     'features' : ['explain_model', 'nodes_count']
+        # }
     }
     generation_config = {
-        'samples_number': 2,
+        'samples_number': 3,
         'batch_size' : 2,
         'save_examples' : True,
         'result_dir': result_dir
@@ -57,7 +57,7 @@ def main():
         'epochs' : 200,
         'discr_per_gener_iters' : 3,
         'iterations_between_saves': 1,
-        'batch_size': 200,
+        'batch_size': 1000,
         'train_dataset': trainset,
         'test_dataset': testset,
         'workers': 1

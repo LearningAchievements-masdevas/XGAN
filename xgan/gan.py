@@ -16,7 +16,7 @@ from torch.utils.data import BatchSampler, SequentialSampler
 from torchvision.utils import save_image
 from torchsummary import summary
 
-from xgan.xai import GradCam, LIME
+from xgan.xai import GradCam, LIME, LimeRandomForest, GenSpace
 from xgan.utils import check_for_key, prepare_batches, gan_labels
 
 real_label = 1.
@@ -31,14 +31,22 @@ class GAN:
     def __init__(self, device, generator_config, discriminator_config, *, verbose=False, explanation_config=None, dtype=torch.float32):
         self.device = device
         self.dtype = dtype
+        
         self.generator_config = generator_config
         self.generator = self.generator_config['model']
-
         self.generator_optimizer = self.generator_config['optimizer']
+        if 'scheduler' in self.generator_config.keys():
+            self.generator_scheduler = self.generator_config['scheduler']
+        else:
+            self.generator_scheduler = None
         self.discriminator_config = discriminator_config
         self.discriminator = self.discriminator_config['model']
-
         self.discriminator_optimizer = self.discriminator_config['optimizer']
+        if 'scheduler' in self.discriminator_config.keys():
+            self.discriminator_scheduler = self.discriminator_config['scheduler']
+        else:
+            self.discriminator_scheduler = None
+
         self.generator_config['model'].to(device)
         self.discriminator_config['model'].to(device)
         self.verbose = verbose
@@ -60,6 +68,8 @@ class GAN:
                 raise XAIConfigException(f'Unknown parameter \'grad_cam\' in explanation_config : {value}')
         if 'lime' in explanation_config.keys():
             self.lime = explanation_config['lime']['model']
+        if 'genspace' in explanation_config.keys():
+            self.genspace = GenSpace(explanation_config['lime']['genspace'])
         self.explain_methods_prepared = True
 
     def _calculate_iters_count(self, train_config):
@@ -71,13 +81,11 @@ class GAN:
             discr_iters = 1
         return discr_iters, gen_iters
 
-    def save_gan(self, epoch='final'): # TODO
+    def save_gan(self, postfix='final'): # TODO
         result_dir = self.generation_config['result_dir']
         models_dir = os.path.join(result_dir, 'model')
-        # if not os.path.exists(models_dir):
-        #     os.makedirs(models_dir)
-        torch.save(self.generator, os.path.join(models_dir, f'generator_{epoch}_epoch.pt'))
-        torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{epoch}_epoch.pt'))
+        torch.save(self.generator, os.path.join(models_dir, f'generator_{postfix}.pt'))
+        torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{postfix}.pt'))
 
     def _save_images(self, images, images_dir, content_type_name, samples_number, start_index=0):
         if not os.path.exists(images_dir):
@@ -86,7 +94,7 @@ class GAN:
             formatted_idx_value = '0' * (len(str(samples_number)) - len(str(start_index + idx))) + str(start_index + idx)
             save_image(image, os.path.join(images_dir, f'{formatted_idx_value}_{content_type_name}.png'))
         return images_dir
-                
+
     def clear_result_dir(self, generation_config):
         result_dir = generation_config['result_dir']
         if os.path.exists(result_dir):
@@ -109,7 +117,7 @@ class GAN:
                 break
             reduced_batch_data = batch_data[:remained]
             self._save_images(reduced_batch_data, result_dir, postfix, samples_number, samples_number - remained)
-            remained -= batch_size
+            remained -= reduced_batch_data.shape[0]
 
     def train(self, train_config, generation_config=None):
         if not self.explain_methods_prepared:
@@ -147,7 +155,7 @@ class GAN:
         for epoch in range(max_epochs):
             formatted_epoch_value = '0' * (max_epochs_field_size - len(str(epoch))) + str(epoch)
             progress_bar_epoch.set_description(f'# Training. Processing {epoch+1} epoch')
-            if generation_config is not None and epoch != 0 and epoch % int(train_config['iterations_between_saves']) == 0:
+            if generation_config is not None and epoch % int(train_config['iterations_between_saves']) == 0:
                 self.generate(f'epoch_{formatted_epoch_value}', generation_config, train_config=train_config)
             batch_generator = prepare_batches(train_data, train_labels, batch_size)
             continue_flag = True
@@ -178,6 +186,8 @@ class GAN:
                     output = self.discriminator(data).view(-1)
                     err_discriminant_real = criterion(output, label)
                     err_discriminant_real.backward()
+                    if 'grad_norm' in self.discriminator_config.keys():
+                        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.discriminator_config['grad_norm'])
                     
                     self.discriminator_optimizer.step()
                     
@@ -193,10 +203,16 @@ class GAN:
                     output = self.discriminator(generator_out).view(-1)
                     err_discriminator = criterion(output, label)
                     err_discriminator.backward()
+                    if 'grad_norm' in self.generator_config.keys():
+                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.generator_config['grad_norm'])
                     self.generator_optimizer.step()
                     del label, generator_out, output, err_discriminator
                     gc.collect()
                     torch.cuda.empty_cache()
+                if self.generator_scheduler is not None:
+                    self.generator_scheduler.step()
+                if self.discriminator_scheduler is not None:
+                    self.discriminator_scheduler.step()
             progress_bar_epoch.update(1)
 
     def _internal_generate(self, batch_size):
@@ -227,9 +243,12 @@ class GAN:
         samples_number = generation_config['samples_number']
         samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
         max_field_size = len(str(samples_number))
-
+        generation_explanation = {}
+        check_nodes_count = isinstance(self.lime, LimeRandomForest) and 'nodes_count' in self.explanation_config['lime']['features']
+        if check_nodes_count:
+            lime_nodes_counts = []
         for sample_idx, batch_indices in enumerate(samples_indices):
-            generated_data = self._internal_generate(batch_size)
+            generated_data = self._internal_generate(len(batch_indices))
             for subout in generated_data:
                 generated_set.append(subout.detach())
             if self.grad_cam is not None:
@@ -245,15 +264,32 @@ class GAN:
                     train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
                     
                     lime_helper = LIME(self, self.explanation_config['lime'])
-                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, train_labels, batch_size, generated_data)
+                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, batch_size, generated_data)
+                    
                     for idx, subout in enumerate(generated_data):
-                        formatted_idx = '0' * (max_field_size - len(str(idx))) + str(idx)
+                        formatted_idx = '0' * (max_field_size - len(str(idx + sample_idx * batch_size))) + str(idx + sample_idx * batch_size)
                         weights = weights_batch[:, idx]
-                        self.lime.explain_sample(subout, X, y, weights, features, result_dir, formatted_idx, self.explanation_config, generation_config)
+                        explanation = self.lime.explain_sample(subout, X, y, weights, features, result_dir, formatted_idx, self.explanation_config, generation_config)
+                        if check_nodes_count:
+                            lime_nodes_counts.append(explanation['nodes_count'])
+                    del X, y, weights_batch, features, lime_helper
 
-            del generated_data, subout, X, y, weights_batch, features, lime_helper
+            if self.genspace is not None:
+                train_data = train_config['train_dataset']
+                train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+                X, y = self.genspace.generate_data_for_ml(train_data, train_labels, batch_size)
+                self.genspace.explain_space(X, y, batch_size)
+
+            del generated_data, subout
             gc.collect()
             torch.cuda.empty_cache()
+
+        if check_nodes_count:
+            generation_explanation['lime_mean_nodes_count'] = sum(lime_nodes_counts) // len(lime_nodes_counts)
+        
+        if len(generation_explanation.keys()) > 0:
+            with open(os.path.join(result_dir, 'generation_explanation.json'), 'w') as f:
+                f.write(json.dumps(generation_explanation, indent=4, sort_keys=True))
 
         self._save_images(generated_set, result_dir, 'generated', len(generated_set))
         if self.grad_cam:

@@ -24,7 +24,7 @@ class LIME:
             features.append('x'.join([str(value) for value in index]))
         return features
 
-    def generate_data_for_ml(self, data, labels, batch_size, generated_data):
+    def generate_data_for_ml(self, data, batch_size, generated_data):
         features = self._generate_features(generated_data[0].shape)
         generated_data = generated_data.reshape(generated_data.shape[0], -1)
         generated_count = 0
@@ -41,7 +41,7 @@ class LIME:
             distances_list.append(local_distances)
             generated_count += samples_to_gen
 
-        real_batch_generator = prepare_batches(data, labels, batch_size)
+        real_batch_generator = prepare_batches(data, None, batch_size)
         remained = self.explanation_config_lime['samples_per_class']
         for batch_idx, (batch_data, _) in real_batch_generator:
             if remained == 0:

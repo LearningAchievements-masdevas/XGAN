@@ -22,9 +22,20 @@ class LimeRandomForest(LimeModel):
 
 	def explain_sample(self, explained_sample, X, y, weights, features, prefix_path, formatted_idx, explanation_config, generation_config):
 		self.model.fit(X, y, sample_weight=weights)
+		explanation = {}
 		if 'features' in explanation_config['lime'].keys():
 			if 'explain_model' in explanation_config['lime']['features']:
 				self._explain_model(generation_config, formatted_idx, features, prefix_path)
+			if 'nodes_count' in explanation_config['lime']['features']:
+				explanation['nodes_count'] = self._calculate_nodes_count()
+		return explanation
+
+
+	def _calculate_nodes_count(self):
+		nodes_count = 0
+		for estimator in self.model.estimators_:
+			nodes_count += estimator.tree_.node_count
+		return nodes_count
 
 	def _explain_model(self, generation_config, formatted_idx, features, prefix_path):
 		shape = (3, 2)
