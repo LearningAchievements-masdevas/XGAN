@@ -3,10 +3,9 @@ import torch.nn as nn
 import numpy as np
 
 class Generator(nn.Module):
-    def __init__(self, config):
+    def __init__(self, z_shape):
         super().__init__()
-        self.config = config
-        self.z_shape = config['z_shape']
+        self.z_shape = z_shape
 
         self.layer1 = nn.Sequential(
             nn.Linear(np.prod(self.z_shape), 128*7*7),
@@ -27,14 +26,9 @@ class Generator(nn.Module):
         out = self.layer2(out)
         return out
 
-    def get_input_shape(self, batch_size):
-        return (batch_size, ) + self.z_shape
-
 class Discriminator(nn.Module):
-    def __init__(self, config):
+    def __init__(self):
         super().__init__()
-        self.config = config
-
         self.layer1 = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=(5, 5), 
                 stride=(2, 2)),

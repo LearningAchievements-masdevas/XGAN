@@ -6,11 +6,11 @@ from .lime import LimeModel
 from xgan.utils import check_for_key
 from xgan.utils import gan_labels
 
-try:
-	from sklearnex import patch_sklearn
-	patch_sklearn()
-except:
-	pass
+# try:
+# 	from sklearnex import patch_sklearn
+# 	patch_sklearn()
+# except:
+# 	pass
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import plot_tree
@@ -29,7 +29,6 @@ class LimeRandomForest(LimeModel):
 			if 'nodes_count' in explanation_config['lime']['features']:
 				explanation['nodes_count'] = self._calculate_nodes_count()
 		return explanation
-
 
 	def _calculate_nodes_count(self):
 		nodes_count = 0

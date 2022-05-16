@@ -16,11 +16,8 @@ from torch.utils.data import BatchSampler, SequentialSampler
 from torchvision.utils import save_image
 from torchsummary import summary
 
-from xgan.xai import GradCam, LIME, LimeRandomForest, GenSpace
+from xgan.xai import GradCam, LIME, LimeRandomForest, GenSpace, ShapGen
 from xgan.utils import check_for_key, prepare_batches, gan_labels
-
-real_label = 1.
-fake_label = 0.
 
 class GAN:
     def get_str_datetime(self):
@@ -35,10 +32,16 @@ class GAN:
         self.generator_config = generator_config
         self.generator = self.generator_config['model']
         self.generator_optimizer = self.generator_config['optimizer']
+        if 'noize_generator' in self.generator_config.keys():
+            self.noize_generator = self.generator_config['noize_generator']
+        else:
+            self.noize_generator = lambda generator, shape: np.random.normal(0, 1, size=shape)
         if 'scheduler' in self.generator_config.keys():
             self.generator_scheduler = self.generator_config['scheduler']
         else:
             self.generator_scheduler = None
+
+
         self.discriminator_config = discriminator_config
         self.discriminator = self.discriminator_config['model']
         self.discriminator_optimizer = self.discriminator_config['optimizer']
@@ -55,6 +58,8 @@ class GAN:
         
         self.grad_cam = None
         self.lime = None
+        self.genspace = None
+        self.shap_gen = None
 
         self.explain_methods_prepared = False
 
@@ -69,7 +74,9 @@ class GAN:
         if 'lime' in explanation_config.keys():
             self.lime = explanation_config['lime']['model']
         if 'genspace' in explanation_config.keys():
-            self.genspace = GenSpace(explanation_config['lime']['genspace'])
+            self.genspace = GenSpace(self, explanation_config['genspace'])
+        if 'shap_gen' in explanation_config.keys():
+            self.shap_gen = ShapGen(self, self.generator, explanation_config['shap_gen']['model'])
         self.explain_methods_prepared = True
 
     def _calculate_iters_count(self, train_config):
@@ -104,9 +111,9 @@ class GAN:
     def _print_summary(self, generator_config, discriminator_config):
         if self.verbose:
             print('### Generator summary')
-            summary(generator_config['model'], generator_config['z_shape'])
+            summary(self.generator, self.generator_config['input_shape'])
             print('### Discriminator summary')
-            summary(discriminator_config['model'], discriminator_config['input_shape'])
+            summary(self.discriminator, self.discriminator_config['input_shape'])
 
     def _save_examples(self, samples_number, data, postfix, result_dir, batch_size):
         batch_generator = prepare_batches(data, None, batch_size)
@@ -215,9 +222,14 @@ class GAN:
                     self.discriminator_scheduler.step()
             progress_bar_epoch.update(1)
 
+    def _get_noize(self, batch_size):
+        noize_shape = (batch_size, ) + self.generator_config['input_shape']
+        noize_np = self.noize_generator(self.generator, noize_shape)
+        return noize_np
+
     def _internal_generate(self, batch_size):
-        noize_np = np.random.normal(0, 1, size=self.generator.get_input_shape(batch_size))
-        noize = torch.from_numpy(noize_np).float().to(self.device)
+        noize_np = self._get_noize(batch_size)
+        noize = torch.from_numpy(noize_np).to(dtype=self.dtype, device=self.device)
         return self.generator(noize)
 
     def generate(self, postfix, generation_config, train_config=None):
@@ -273,20 +285,34 @@ class GAN:
                         if check_nodes_count:
                             lime_nodes_counts.append(explanation['nodes_count'])
                     del X, y, weights_batch, features, lime_helper
-
-            if self.genspace is not None:
-                train_data = train_config['train_dataset']
-                train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
-                X, y = self.genspace.generate_data_for_ml(train_data, train_labels, batch_size)
-                self.genspace.explain_space(X, y, batch_size)
-
             del generated_data, subout
             gc.collect()
             torch.cuda.empty_cache()
+        if self.genspace is not None:
+            with torch.no_grad():
+                train_data = train_config['train_dataset']
+                train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+                X, y = self.genspace.generate_data_for_ml(train_data, train_labels, batch_size)
+                genspace_counts = self.genspace.explain_space(X, y, batch_size, result_dir)
+        if self.shap_gen is not None:
+            train_data = train_config['train_dataset']
+            train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+            if 'columns' not in self.explanation_config['shap_gen']:
+                num_columns = np.prod(np.array(self.generator_config['input_shape']))
+                columns = ['feat_'+str(column_idx) for column_idx in range(num_columns)]
+            else:
+                columns = self.explanation_config['shap_gen']['columns']
+            X, y = self.shap_gen.generate_data_for_ml(train_data, train_labels, batch_size)
+            self.shap_gen.fit_ml(X, y)
+            self.shap_gen.explain(self.explanation_config['shap_gen'], self._get_noize, columns, result_dir)
 
         if check_nodes_count:
             generation_explanation['lime_mean_nodes_count'] = sum(lime_nodes_counts) // len(lime_nodes_counts)
-        
+
+        if self.genspace is not None:
+            generation_explanation['genspace'] = {}
+            generation_explanation['genspace']['counts'] = genspace_counts
+
         if len(generation_explanation.keys()) > 0:
             with open(os.path.join(result_dir, 'generation_explanation.json'), 'w') as f:
                 f.write(json.dumps(generation_explanation, indent=4, sort_keys=True))
