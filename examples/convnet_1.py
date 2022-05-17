@@ -21,7 +21,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 def convert_data_to_tensor(dataset, dtype):
     cpu = torch.device('cpu')
-    batches = prepare_batches(dataset, None, 1024)
+    batches = prepare_batches(dataset, None, 512)
     X_list = []
     y_list = []
     for _, (batch_data, batch_labels) in batches:
@@ -29,8 +29,6 @@ def convert_data_to_tensor(dataset, dtype):
         y_list.append(batch_labels)
     X = torch.cat(X_list).to(device=cpu, dtype=dtype)
     y = torch.cat(y_list).to(device=cpu, dtype=dtype)
-    print(X.shape)
-    print(y.shape)
     return X, y
 
 def main():
@@ -44,7 +42,6 @@ def main():
     train_X, train_y = convert_data_to_tensor(trainset, dtype)
     testset = torchvision.datasets.MNIST(data_root, train=False, download=True, transform=transform)
     test_X, test_y = convert_data_to_tensor(testset, dtype)
-    gc.collect()
     torch.cuda.empty_cache()
     gan_lr = 0.0002
     criterion = torch.nn.BCELoss()
@@ -68,32 +65,31 @@ def main():
     }
     
     explanation_config = {
-        # 'grad_cam': True,
-        # 'lime': {
-        #     'model' : LimeRandomForest(n_estimators=10, max_depth=4),
-        #     'samples_per_class': 10000,
-        #     'features' : ['explain_model', 'nodes_count']
-        # }
-        # 'genspace': {
-        #     'model' : RandomForestClassifier(n_estimators=100, max_depth=12),
-        #     'samples_to_generate' : 1000
-        # }
+        'grad_cam': True,
+        'lime': {
+            'model' : LimeRandomForest(n_estimators=10, max_depth=4),
+            'samples_per_class': 10000,
+            'features' : ['explain_model', 'nodes_count']
+        },
+        'genspace': {
+            'model' : RandomForestClassifier(n_estimators=100, max_depth=12),
+            'samples_to_generate' : 1000
+        },
         'shap_gen': {
             'model': RandomForestClassifier(n_estimators=100, max_depth=12),
             'background_samples_to_gen': 100,
             'test_samples_to_gen': 5,
             'shap_nsamples': 175,
-            'features': ['summary', 'waterfall'],
-            # 'waterfall_samples_count': 2
+            'features': ['summary', 'waterfall', 'dependence']
         }
     }
     generation_config = {
         'samples_number': 3,
         'batch_size' : 256,
         'save_examples' : True,
+        'save_models': True,
         'result_dir': result_dir
     }
-    
     
     generator_config['optimizer'] = optim.Adam(generator_config['model'].parameters(), lr=gan_lr, betas=(0.5, 0.999))
     # generator_config['scheduler'] = ExponentialLR(generator_config['optimizer'], gamma=0.995)
@@ -104,10 +100,10 @@ def main():
     gan = GAN(device, generator_config, discriminator_config, verbose=True, explanation_config=explanation_config, dtype=dtype)
     gan.clear_result_dir(generation_config)
     train_config = {
-        'epochs' : 200,
+        'epochs' : 150,
         'discr_per_gener_iters' : 3,
-        'iterations_between_saves': 10,
-        'batch_size': 1024,
+        'iterations_between_saves': 5,
+        'batch_size': 512,
         'train_dataset': train_X,
         'train_labels': train_y,
         'test_dataset': test_X,

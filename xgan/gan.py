@@ -88,11 +88,11 @@ class GAN:
             discr_iters = 1
         return discr_iters, gen_iters
 
-    def save_gan(self, postfix='final'): # TODO
-        result_dir = self.generation_config['result_dir']
-        models_dir = os.path.join(result_dir, 'model')
-        torch.save(self.generator, os.path.join(models_dir, f'generator_{postfix}.pt'))
-        torch.save(self.discriminator, os.path.join(models_dir, f'discriminator_{postfix}.pt'))
+    def save_gan(self, result_dir, postfix):
+        models_dir = os.path.join(result_dir, 'models')
+        os.makedirs(models_dir)
+        torch.save(self.generator.state_dict(), os.path.join(models_dir, f'generator_{postfix}.pt'))
+        torch.save(self.discriminator.state_dict(), os.path.join(models_dir, f'discriminator_{postfix}.pt'))
 
     def _save_images(self, images, images_dir, content_type_name, samples_number, start_index=0):
         if not os.path.exists(images_dir):
@@ -152,7 +152,6 @@ class GAN:
             batch_size = generation_config['batch_size']
             self._save_examples(samples_number, train_data, train_labels, 'train_data_example', result_dir, batch_size)
             self._save_examples(samples_number, test_data, test_labels, 'test_data_example', result_dir, batch_size)
-            gc.collect()
             torch.cuda.empty_cache()
         
         batch_size = train_config['batch_size']
@@ -161,9 +160,10 @@ class GAN:
         progress_bar_epoch = tqdm(range(max_epochs))
         for epoch in range(max_epochs):
             formatted_epoch_value = '0' * (max_epochs_field_size - len(str(epoch))) + str(epoch)
-            progress_bar_epoch.set_description(f'# Training. Processing {epoch+1} epoch')
             if generation_config is not None and epoch % int(train_config['iterations_between_saves']) == 0:
+                progress_bar_epoch.set_description(f'# Generating. Processing #{epoch} epoch')
                 self.generate(f'epoch_{formatted_epoch_value}', generation_config, train_config=train_config)
+            progress_bar_epoch.set_description(f'# Training. Processing #{epoch} epoch')
             batch_generator = prepare_batches(train_data, train_labels, batch_size)
             continue_flag = True
             while continue_flag:
@@ -197,11 +197,8 @@ class GAN:
                         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.discriminator_config['grad_norm'])
                     
                     self.discriminator_optimizer.step()
-                    
                     del device_data, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
+                    
                 for gen_iter in range(gen_iters):
                     # Calculate generations and update generator's weights
                     self.generator.zero_grad()
@@ -214,12 +211,12 @@ class GAN:
                         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.generator_config['grad_norm'])
                     self.generator_optimizer.step()
                     del label, generator_out, output, err_discriminator
-                    gc.collect()
-                    torch.cuda.empty_cache()
                 if self.generator_scheduler is not None:
                     self.generator_scheduler.step()
                 if self.discriminator_scheduler is not None:
                     self.discriminator_scheduler.step()
+                gc.collect()
+                torch.cuda.empty_cache()
             progress_bar_epoch.update(1)
 
     def _get_noize(self, batch_size):
@@ -242,6 +239,9 @@ class GAN:
             result_dir = 'result_'+self.datetime_prefix
         result_dir = os.path.join(result_dir, postfix)
         os.makedirs(result_dir)
+
+        if check_for_key(generation_config, 'save_models', True):
+            self.save_gan(result_dir, postfix)
 
         batch_size = generation_config['batch_size']
         generated_set = []
@@ -276,7 +276,7 @@ class GAN:
                     train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
                     
                     lime_helper = LIME(self, self.explanation_config['lime'])
-                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, batch_size, generated_data)
+                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, train_labels, batch_size, generated_data)
                     
                     for idx, subout in enumerate(generated_data):
                         formatted_idx = '0' * (max_field_size - len(str(idx + sample_idx * batch_size))) + str(idx + sample_idx * batch_size)
@@ -286,7 +286,6 @@ class GAN:
                             lime_nodes_counts.append(explanation['nodes_count'])
                     del X, y, weights_batch, features, lime_helper
             del generated_data, subout
-            gc.collect()
             torch.cuda.empty_cache()
         if self.genspace is not None:
             with torch.no_grad():
@@ -325,3 +324,5 @@ class GAN:
             images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake', len(grad_cam_fake))
             with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
                 f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))
+        gc.collect()
+        torch.cuda.empty_cache()

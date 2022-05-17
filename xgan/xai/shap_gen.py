@@ -28,8 +28,6 @@ class FullGAN(torch.nn.Module):
         generator_out = generator_out.reshape(generator_out.shape[0], -1).detach().cpu().numpy()
         result = self.classifier.predict_proba(generator_out)
         del generator_out
-        gc.collect()
-        torch.cuda.empty_cache()
         self.generator.to(self.device)
         return result
 
@@ -59,8 +57,6 @@ class ShapGen:
         y = np.concatenate(y_list)
         
         del batch_data, batch_labels
-        gc.collect()
-        torch.cuda.empty_cache()
         return X, y
 
     def fit_ml(self, X, y):
@@ -68,16 +64,15 @@ class ShapGen:
         self.full_gan.classifier.fit(X, y)
 
     def explain(self, shap_gen_config, noize_getter, columns, result_dir):
+        torch.cuda.empty_cache()
         with torch.no_grad():
             shap_dir = os.path.join(result_dir, 'shap')
             os.makedirs(shap_dir)
+            
+            # Train SHAP
             def predict(X):
                 return self.full_gan.forward(X)
             background_samples = noize_getter(shap_gen_config['background_samples_to_gen'])
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Train SHAP
             e = shap.KernelExplainer(predict, background_samples)
             test_samples = noize_getter(shap_gen_config['test_samples_to_gen'])
 
