@@ -42,8 +42,9 @@ def main():
     train_X, train_y = convert_data_to_tensor(trainset, dtype)
     testset = torchvision.datasets.MNIST(data_root, train=False, download=True, transform=transform)
     test_X, test_y = convert_data_to_tensor(testset, dtype)
+    gc.collect()
     torch.cuda.empty_cache()
-    gan_lr = 0.0002
+    gan_lr = 0.0004
     criterion = torch.nn.BCELoss()
     convnet = Convnet1()
 
@@ -79,7 +80,7 @@ def main():
             'model': RandomForestClassifier(n_estimators=100, max_depth=12),
             'background_samples_to_gen': 100,
             'test_samples_to_gen': 5,
-            'shap_nsamples': 175,
+            'shap_nsamples': 125,
             'features': ['summary', 'waterfall', 'dependence']
         }
     }
@@ -92,9 +93,9 @@ def main():
     }
     
     generator_config['optimizer'] = optim.Adam(generator_config['model'].parameters(), lr=gan_lr, betas=(0.5, 0.999))
-    # generator_config['scheduler'] = ExponentialLR(generator_config['optimizer'], gamma=0.995)
+    generator_config['scheduler'] = ExponentialLR(generator_config['optimizer'], gamma=0.98)
     discriminator_config['optimizer'] = optim.Adam(discriminator_config['model'].parameters(), lr=gan_lr, betas=(0.5, 0.999))
-    # discriminator_config['scheduler'] = ExponentialLR(discriminator_config['optimizer'], gamma=0.995)
+    discriminator_config['scheduler'] = ExponentialLR(discriminator_config['optimizer'], gamma=0.98)
 
     device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
     gan = GAN(device, generator_config, discriminator_config, verbose=True, explanation_config=explanation_config, dtype=dtype)
@@ -102,12 +103,13 @@ def main():
     train_config = {
         'epochs' : 150,
         'discr_per_gener_iters' : 3,
-        'iterations_between_saves': 5,
-        'batch_size': 512,
+        'iterations_between_saves': 8,
+        'batch_size': 256,
         'train_dataset': train_X,
         'train_labels': train_y,
         'test_dataset': test_X,
         'test_labels': test_y,
+        'gc_run_prob': 0.2
     }
     
     gan.train(train_config, generation_config)

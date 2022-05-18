@@ -9,15 +9,18 @@ import logging
 from datetime import datetime
 from tqdm.auto import tqdm
 import json
+import time
+import inspect
 
 import torch
 from torch.utils.data import BatchSampler, SequentialSampler
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from torchvision.utils import save_image
 from torchsummary import summary
 
 from xgan.xai import GradCam, LIME, LimeRandomForest, GenSpace, ShapGen
-from xgan.utils import check_for_key, prepare_batches, gan_labels
+from xgan.utils import check_for_key, prepare_batches, gan_labels, set_flush_data_limit, flush_data
 
 class GAN:
     def get_str_datetime(self):
@@ -55,11 +58,6 @@ class GAN:
         self.verbose = verbose
         self.explanation_config = explanation_config
         self.datetime_prefix = self.get_str_datetime()
-        
-        self.grad_cam = None
-        self.lime = None
-        self.genspace = None
-        self.shap_gen = None
 
         self.explain_methods_prepared = False
 
@@ -67,16 +65,22 @@ class GAN:
         explanation_config = self.explanation_config
         if 'grad_cam' in explanation_config.keys():
             if explanation_config['grad_cam'] == True:
-                self.grad_cam = GradCam(explanation_config, self)
+                self.grad_cam_run = True
             else:
                 value = explanation_config['grad_cam']
                 raise XAIConfigException(f'Unknown parameter \'grad_cam\' in explanation_config : {value}')
+        else:
+            self.grad_cam_run = False
         if 'lime' in explanation_config.keys():
             self.lime = explanation_config['lime']['model']
         if 'genspace' in explanation_config.keys():
-            self.genspace = GenSpace(self, explanation_config['genspace'])
+            self.genspace_run = True
+        else:
+            self.genspace_run = False
         if 'shap_gen' in explanation_config.keys():
-            self.shap_gen = ShapGen(self, self.generator, explanation_config['shap_gen']['model'])
+            self.shap_gen_run = True
+        else:
+            self.shap_gen_run = False
         self.explain_methods_prepared = True
 
     def _calculate_iters_count(self, train_config):
@@ -127,6 +131,11 @@ class GAN:
             remained -= reduced_batch_data.shape[0]
 
     def train(self, train_config, generation_config=None):
+        funcname = inspect.currentframe().f_code.co_name
+        if 'gc_run_prob' in train_config.keys():
+            set_flush_data_limit(inspect.currentframe().f_code.co_name, train_config['gc_run_prob'])
+        else:
+            set_flush_data_limit(inspect.currentframe().f_code.co_name, 1.)
         if not self.explain_methods_prepared:
             self._prepare_explain_methods()
         
@@ -152,12 +161,13 @@ class GAN:
             batch_size = generation_config['batch_size']
             self._save_examples(samples_number, train_data, train_labels, 'train_data_example', result_dir, batch_size)
             self._save_examples(samples_number, test_data, test_labels, 'test_data_example', result_dir, batch_size)
-            torch.cuda.empty_cache()
+            flush_data(funcname)
         
         batch_size = train_config['batch_size']
         max_epochs = train_config['epochs']
         max_epochs_field_size = len(str(max_epochs))
         progress_bar_epoch = tqdm(range(max_epochs))
+        
         for epoch in range(max_epochs):
             formatted_epoch_value = '0' * (max_epochs_field_size - len(str(epoch))) + str(epoch)
             if generation_config is not None and epoch % int(train_config['iterations_between_saves']) == 0:
@@ -176,17 +186,17 @@ class GAN:
                         continue_flag = False
                         break
                     device_data = images[0].to(self.device)
-                    batch_size = device_data.size(0)
+                    data_batch_size = device_data.size(0)
 
                     # Prepare fake data
-                    generator_out = self._internal_generate(batch_size).detach()
+                    generator_out = self._internal_generate(data_batch_size).detach()
 
                     # Concat data
                     data = torch.cat((device_data, generator_out))
 
                     # Prepare labels                
-                    label_real = torch.full((batch_size,), gan_labels['real'], dtype=self.dtype, device=self.device)
-                    label_fake = torch.full((batch_size,), gan_labels['fake'], dtype=self.dtype, device=self.device)
+                    label_real = torch.full((data_batch_size,), gan_labels['real'], dtype=self.dtype, device=self.device)
+                    label_fake = torch.full((data_batch_size,), gan_labels['fake'], dtype=self.dtype, device=self.device)
                     label = torch.cat((label_real, label_fake))
 
                     # Calculate predictions of discriminator and update discriminator's weights by real and fake data
@@ -197,8 +207,9 @@ class GAN:
                         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.discriminator_config['grad_norm'])
                     
                     self.discriminator_optimizer.step()
-                    del device_data, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
-                    
+                    del indices, images, data_batch_size, device_data, generator_out, data, label_real, label_fake, label, output, err_discriminant_real
+                    flush_data(funcname)
+
                 for gen_iter in range(gen_iters):
                     # Calculate generations and update generator's weights
                     self.generator.zero_grad()
@@ -211,12 +222,11 @@ class GAN:
                         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.generator_config['grad_norm'])
                     self.generator_optimizer.step()
                     del label, generator_out, output, err_discriminator
-                if self.generator_scheduler is not None:
-                    self.generator_scheduler.step()
-                if self.discriminator_scheduler is not None:
-                    self.discriminator_scheduler.step()
-                gc.collect()
-                torch.cuda.empty_cache()
+                    flush_data(funcname)
+            if self.generator_scheduler is not None:
+                self.generator_scheduler.step()
+            if self.discriminator_scheduler is not None:
+                self.discriminator_scheduler.step()
             progress_bar_epoch.update(1)
 
     def _get_noize(self, batch_size):
@@ -230,6 +240,11 @@ class GAN:
         return self.generator(noize)
 
     def generate(self, postfix, generation_config, train_config=None):
+        funcname = inspect.currentframe().f_code.co_name
+        if 'gc_run_prob' in generation_config.keys():
+            set_flush_data_limit(funcname, generation_config['gc_run_prob'])
+        else:
+            set_flush_data_limit(funcname, 1.)
         if not self.explain_methods_prepared:
             self._prepare_explain_methods()
             
@@ -246,7 +261,7 @@ class GAN:
         batch_size = generation_config['batch_size']
         generated_set = []
         
-        if self.grad_cam:
+        if self.grad_cam_run:
             grad_cam_real = []
             grad_cam_fake = []
             grad_cam_prob_real = {}
@@ -263,13 +278,16 @@ class GAN:
             generated_data = self._internal_generate(len(batch_indices))
             for subout in generated_data:
                 generated_set.append(subout.detach())
-            if self.grad_cam is not None:
+            if self.grad_cam_run:
+                grad_cam = GradCam(self.explanation_config, self)
                 for idx, subout in enumerate(generated_data):
-                    grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = self.grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
+                    grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
                     grad_cam_real.append(grad_cam_real_local.detach())
                     grad_cam_fake.append(grad_cam_fake_local.detach())
                     grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
                     grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
+                del grad_cam
+                flush_data(funcname)
             if self.lime is not None:
                 with torch.no_grad():
                     train_data = train_config['train_dataset']
@@ -284,31 +302,38 @@ class GAN:
                         explanation = self.lime.explain_sample(subout, X, y, weights, features, result_dir, formatted_idx, self.explanation_config, generation_config)
                         if check_nodes_count:
                             lime_nodes_counts.append(explanation['nodes_count'])
-                    del X, y, weights_batch, features, lime_helper
+                    del X, y, weights_batch, weights, features, lime_helper
+                flush_data(funcname)
             del generated_data, subout
-            torch.cuda.empty_cache()
-        if self.genspace is not None:
+        if self.genspace_run:
             with torch.no_grad():
+                genspace = GenSpace(self, self.explanation_config['genspace'])
                 train_data = train_config['train_dataset']
                 train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
-                X, y = self.genspace.generate_data_for_ml(train_data, train_labels, batch_size)
-                genspace_counts = self.genspace.explain_space(X, y, batch_size, result_dir)
-        if self.shap_gen is not None:
-            train_data = train_config['train_dataset']
-            train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
-            if 'columns' not in self.explanation_config['shap_gen']:
-                num_columns = np.prod(np.array(self.generator_config['input_shape']))
-                columns = ['feat_'+str(column_idx) for column_idx in range(num_columns)]
-            else:
-                columns = self.explanation_config['shap_gen']['columns']
-            X, y = self.shap_gen.generate_data_for_ml(train_data, train_labels, batch_size)
-            self.shap_gen.fit_ml(X, y)
-            self.shap_gen.explain(self.explanation_config['shap_gen'], self._get_noize, columns, result_dir)
+                X, y = genspace.generate_data_for_ml(train_data, train_labels, batch_size)
+                genspace_counts = genspace.explain_space(X, y, batch_size, result_dir)
+                del X, y, genspace
+            flush_data(funcname)
+        if self.shap_gen_run:
+            with torch.no_grad():
+                shap_gen = ShapGen(self, self.generator, self.explanation_config['shap_gen']['model'])
+                train_data = train_config['train_dataset']
+                train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+                if 'columns' not in self.explanation_config['shap_gen']:
+                    num_columns = np.prod(np.array(self.generator_config['input_shape']))
+                    columns = ['feat_'+str(column_idx) for column_idx in range(num_columns)]
+                else:
+                    columns = self.explanation_config['shap_gen']['columns']
+                X, y = shap_gen.generate_data_for_ml(train_data, train_labels, batch_size)
+                shap_gen.fit_ml(X, y)
+                shap_gen.explain(self.explanation_config['shap_gen'], self._get_noize, columns, result_dir)
+                del X, y, columns, shap_gen
+            flush_data(funcname)
 
         if check_nodes_count:
             generation_explanation['lime_mean_nodes_count'] = sum(lime_nodes_counts) // len(lime_nodes_counts)
 
-        if self.genspace is not None:
+        if self.genspace_run:
             generation_explanation['genspace'] = {}
             generation_explanation['genspace']['counts'] = genspace_counts
 
@@ -317,12 +342,11 @@ class GAN:
                 f.write(json.dumps(generation_explanation, indent=4, sort_keys=True))
 
         self._save_images(generated_set, result_dir, 'generated', len(generated_set))
-        if self.grad_cam:
+        if self.grad_cam_run:
             images_dir = self._save_images(grad_cam_real, result_dir, 'grad_cam_real', len(grad_cam_real))
             with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
                 f.write(json.dumps(grad_cam_prob_real, indent=4, sort_keys=True))
             images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake', len(grad_cam_fake))
             with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
                 f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))
-        gc.collect()
-        torch.cuda.empty_cache()
+            del grad_cam_real, grad_cam_fake

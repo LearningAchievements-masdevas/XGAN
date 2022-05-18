@@ -1,3 +1,4 @@
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -40,6 +41,7 @@ class LIME:
             local_distances = torch.cdist(generated_samples, generated_data, p=2).cpu().numpy()
             distances_list.append(local_distances)
             generated_count += samples_to_gen
+            del samples_to_gen, generated_samples, local_distances
 
         real_batch_generator = prepare_batches(data, labels, batch_size)
         remained = self.explanation_config_lime['samples_per_class']
@@ -52,6 +54,7 @@ class LIME:
             X_list.append(reduced_batch_data.cpu().numpy())
             distances_list.append(local_distances)
             remained -= reduced_batch_data.shape[0]
+            del batch_idx, batch_data, _, reduced_batch_data, local_distances
         
         X = pd.DataFrame(data=np.concatenate(X_list), columns=features)
         distances = np.concatenate(distances_list)
@@ -62,5 +65,6 @@ class LIME:
         label_real = torch.full((samples_per_class,), gan_labels['real'], dtype=self.gan.dtype, device=self.gan.device)
         label_fake = torch.full((samples_per_class,), gan_labels['fake'], dtype=self.gan.dtype, device=self.gan.device)
         labels = torch.cat([label_fake, label_real], dim=0).cpu().numpy().flatten()
+        del generated_data, generated_count, samples_per_class, X_list, distances_list, real_batch_generator, remained, distances
+        del label_real, label_fake, max_weight
         return X, labels, weights, features
-

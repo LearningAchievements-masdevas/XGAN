@@ -1,3 +1,6 @@
+import gc
+import numpy as np
+
 from collections import OrderedDict
 from torch.utils.data import BatchSampler, RandomSampler
 import torch
@@ -42,3 +45,18 @@ def prepare_batches(data, labels, batch_size):
         dataloader = torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=True)
         batch_generator = _create_batch_generator(dataloader)
     return batch_generator
+
+flush_data_limits = {'default' : 1.}
+
+def _flush_data(value, limit):
+    if value < limit:
+        gc.collect()
+        torch.cuda.empty_cache()
+
+def flush_data(funcname='default'):
+    value = np.random.uniform(low=0., high=1.)
+    _flush_data(value, flush_data_limits[funcname])
+
+def set_flush_data_limit(funcname, limit):
+    global flush_data_limits
+    flush_data_limits[funcname] = limit

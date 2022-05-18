@@ -46,8 +46,7 @@ class GenSpace:
         X = pd.DataFrame(data=np.concatenate(X_list), columns=self.features)
         y = np.concatenate(y_list)
         
-        del batch_data, batch_labels
-        torch.cuda.empty_cache()
+        del batch_data, batch_labels, X_list, y_list
         return X, y
 
     def explain_space(self, X, y, batch_size, path):
@@ -69,5 +68,7 @@ class GenSpace:
         sns.scatterplot(data=data, x='x', y='y', hue='labels', hue_order=hue_order, ax=ax)
         plt.legend()
         plt.savefig(os.path.join(path, f'genspace.png'))
+        fig.clear()
         plt.close(fig)
+        del indices, X_list, X_test, y_predicted, X_embedded, data, hue_order
         return label_counts

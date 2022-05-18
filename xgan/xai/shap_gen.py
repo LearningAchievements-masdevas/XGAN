@@ -36,6 +36,9 @@ class ShapGen:
         self.gan = gan
         self.full_gan = FullGAN(generator, classifier, gan.device)
 
+    def __del__(self):
+        del self.full_gan
+
     def _generate_features(self, sample_shape):
         features = []
         for index in np.ndindex(sample_shape):
@@ -60,11 +63,9 @@ class ShapGen:
         return X, y
 
     def fit_ml(self, X, y):
-        self.X = X
         self.full_gan.classifier.fit(X, y)
 
     def explain(self, shap_gen_config, noize_getter, columns, result_dir):
-        torch.cuda.empty_cache()
         with torch.no_grad():
             shap_dir = os.path.join(result_dir, 'shap')
             os.makedirs(shap_dir)
@@ -92,14 +93,10 @@ class ShapGen:
                 if 'summary' in shap_gen_config['features']:
                     shap.summary_plot(class_shap_values, test_samples_pd, show=False)
                     plt.savefig(os.path.join(shap_dir, f'class_{class_idx}_summary.png'))
+                    plt.cla()
+                    plt.clf()
                     plt.close()
-                if 'dependence' in shap_gen_config['features']:
-                    dependence_dir = os.path.join(shap_dir, 'dependence', f'class_{class_idx}')
-                    os.makedirs(dependence_dir)
-                    for column in columns:
-                        shap.dependence_plot(column, class_shap_values, test_samples_pd, show=False)
-                        plt.savefig(os.path.join(dependence_dir, f'{column}_dependence_plot.png'))
-                        plt.close()
+                del class_idx, class_shap_values
 
             if 'waterfall' in shap_gen_config['features']:
                 waterfall_dir = os.path.join(shap_dir, 'waterfall')
@@ -112,16 +109,8 @@ class ShapGen:
                         fig = plt.gcf()
                         fig.set_size_inches(18, 10, forward=True)
                         fig.savefig(os.path.join(waterfall_class_dir, f'{sample_idx}_waterfall_plot.png'))
+                        plt.cla()
+                        plt.clf()
                         plt.close()
-
-
-                # if 'heatmap' in shap_gen_config['features']:
-                #     
-                #     shap.plots.heatmap(pd_class_shap_values, show=False)
-                #     plt.savefig(os.path.join(shap_dir, f'class_{class_idx}_heatmap.png'))
-                #     plt.close()
-                # if 'bar' in shap_gen_config['features']:
-                #     pd_class_shap_values = pd.DataFrame(data=class_shap_values, columns=features)
-                #     shap.plots.heatmap(pd_class_shap_values, show=False)
-                #     plt.savefig(os.path.join(shap_dir, f'class_{class_idx}_heatmap.png'))
-                #     plt.close()
+                    del class_idx, class_shap_values, waterfall_class_dir
+        del shap_dir, background_samples, predict, e, test_samples, test_predicted, predicted_dict, generator_out, test_samples_pd, shap_values

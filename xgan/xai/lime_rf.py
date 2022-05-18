@@ -18,7 +18,7 @@ from sklearn.tree import plot_tree
 class LimeRandomForest(LimeModel):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
-		self.model = RandomForestClassifier(*args, **kwargs)
+		self.model = RandomForestClassifier(*self.args, **self.kwargs)
 
 	def explain_sample(self, explained_sample, X, y, weights, features, prefix_path, formatted_idx, explanation_config, generation_config):
 		self.model.fit(X, y, sample_weight=weights)
@@ -45,4 +45,6 @@ class LimeRandomForest(LimeModel):
 			estimator = shuffled_estimators[estimator_idx]
 			plot_tree(estimator, ax=axes[plot_idx], feature_names=features, class_names=class_names)
 		plt.savefig(os.path.join(prefix_path, f'{formatted_idx}_lime_model.png'), dpi=800)
+		fig.clear()
 		plt.close(fig)
+		del shape, fig, axes, shuffled_estimators, class_names
