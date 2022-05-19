@@ -65,7 +65,7 @@ class ShapGen:
     def fit_ml(self, X, y):
         self.full_gan.classifier.fit(X, y)
 
-    def explain(self, shap_gen_config, noize_getter, columns, result_dir):
+    def explain(self, shap_gen_config, noize_getter, test_samples, columns, result_dir):
         with torch.no_grad():
             shap_dir = os.path.join(result_dir, 'shap')
             os.makedirs(shap_dir)
@@ -75,7 +75,6 @@ class ShapGen:
                 return self.full_gan.forward(X)
             background_samples = noize_getter(shap_gen_config['background_samples_to_gen'])
             e = shap.KernelExplainer(predict, background_samples)
-            test_samples = noize_getter(shap_gen_config['test_samples_to_gen'])
 
             # Get predictions for test data
             test_predicted = predict(test_samples)
@@ -84,8 +83,8 @@ class ShapGen:
                 f.write(json.dumps(predicted_dict, indent=4, sort_keys=True))
 
             # Save generated data
-            generator_out = self.full_gan.generator(torch.from_numpy(test_samples).float().to(self.gan.device))
-            self.gan._save_images(generator_out, shap_dir, 'shap_test_generated', generator_out.shape[0])
+            # generator_out = self.full_gan.generator(torch.from_numpy(test_samples).float().to(self.gan.device))
+            # self.gan._save_images(generator_out, shap_dir, 'shap_test_generated', generator_out.shape[0])
 
             test_samples_pd = pd.DataFrame(data=test_samples, columns=columns)
             shap_values = e.shap_values(test_samples_pd, nsamples=shap_gen_config['shap_nsamples'], silent=True)
@@ -104,7 +103,7 @@ class ShapGen:
                 for class_idx, class_shap_values in enumerate(shap_values):
                     waterfall_class_dir = os.path.join(waterfall_dir, f'class_{class_idx}')
                     os.makedirs(waterfall_class_dir)
-                    for sample_idx in range(shap_gen_config['test_samples_to_gen']):
+                    for sample_idx in range(test_samples.shape[0]):
                         shap.waterfall_plot(shap.Explanation(values=class_shap_values[sample_idx,:], base_values=e.expected_value[class_idx], data=test_samples[sample_idx], feature_names=columns), show=False)
                         fig = plt.gcf()
                         fig.set_size_inches(18, 10, forward=True)
@@ -113,4 +112,4 @@ class ShapGen:
                         plt.clf()
                         plt.close()
                     del class_idx, class_shap_values, waterfall_class_dir
-        del shap_dir, background_samples, predict, e, test_samples, test_predicted, predicted_dict, generator_out, test_samples_pd, shap_values
+        del shap_dir, background_samples, predict, e, test_predicted, predicted_dict, test_samples_pd, shap_values

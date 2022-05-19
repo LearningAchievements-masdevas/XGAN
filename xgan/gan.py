@@ -2,7 +2,6 @@ import numpy as np
 
 import os
 import shutil
-import gc
 import hashlib
 import time
 import logging
@@ -239,6 +238,10 @@ class GAN:
         noize = torch.from_numpy(noize_np).to(dtype=self.dtype, device=self.device)
         return self.generator(noize)
 
+    def _internal_generate_from_noize(self, noize_np):
+        noize = torch.from_numpy(noize_np).to(dtype=self.dtype, device=self.device)
+        return self.generator(noize)
+
     def generate(self, postfix, generation_config, train_config=None):
         funcname = inspect.currentframe().f_code.co_name
         if 'gc_run_prob' in generation_config.keys():
@@ -259,52 +262,70 @@ class GAN:
             self.save_gan(result_dir, postfix)
 
         batch_size = generation_config['batch_size']
-        generated_set = []
+        samples_number = generation_config['samples_number']
+        samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
+        max_field_size = len(str(samples_number))
+        generation_explanation = {}
         
+        generated_data_list = []
+        noize_list = []
+        for sample_idx, batch_indices in enumerate(samples_indices):
+            noize = self._get_noize(len(batch_indices))
+            noize_list.append(noize)
+            local_generated_data = self._internal_generate_from_noize(noize).detach()
+            generated_data_list.append(local_generated_data)
+        generated_data = torch.cat(generated_data_list, dim=0)
+        noize = np.concatenate(noize_list, axis=0)
+        flush_data(funcname)
+
+        self._save_images(generated_data, result_dir, 'generated', generated_data.shape[0])
+
         if self.grad_cam_run:
             grad_cam_real = []
             grad_cam_fake = []
             grad_cam_prob_real = {}
             grad_cam_prob_fake = {}
+            grad_cam = GradCam(self.explanation_config, self)
+            for idx, subout in enumerate(generated_data):
+                grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
+                grad_cam_real.append(grad_cam_real_local.detach())
+                grad_cam_fake.append(grad_cam_fake_local.detach())
+                grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
+                grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
+            del grad_cam
+            grad_cam_dir = os.path.join(result_dir, 'grad_cam')
+            os.makedirs(grad_cam_dir)
+            images_dir = self._save_images(grad_cam_real, grad_cam_dir, 'grad_cam_real', len(grad_cam_real))
+            with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
+                f.write(json.dumps(grad_cam_prob_real, indent=4, sort_keys=True))
+            images_dir = self._save_images(grad_cam_fake, grad_cam_dir, 'grad_cam_fake', len(grad_cam_fake))
+            with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
+                f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))
+            del grad_cam_real, grad_cam_fake
+            flush_data(funcname)
 
-        samples_number = generation_config['samples_number']
-        samples_indices = BatchSampler(SequentialSampler(range(samples_number)), batch_size=batch_size, drop_last=False)
-        max_field_size = len(str(samples_number))
-        generation_explanation = {}
-        check_nodes_count = isinstance(self.lime, LimeRandomForest) and 'nodes_count' in self.explanation_config['lime']['features']
-        if check_nodes_count:
-            lime_nodes_counts = []
-        for sample_idx, batch_indices in enumerate(samples_indices):
-            generated_data = self._internal_generate(len(batch_indices))
-            for subout in generated_data:
-                generated_set.append(subout.detach())
-            if self.grad_cam_run:
-                grad_cam = GradCam(self.explanation_config, self)
+        if self.lime is not None:
+            check_nodes_count = isinstance(self.lime, LimeRandomForest) and 'nodes_count' in self.explanation_config['lime']['features']
+            if check_nodes_count:
+                lime_nodes_counts = []
+            with torch.no_grad():
+                lime_dir = os.path.join(result_dir, 'lime')
+                train_data = train_config['train_dataset']
+                train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
+                lime_helper = LIME(self, self.explanation_config['lime'])
+                X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, train_labels, batch_size, generated_data)
                 for idx, subout in enumerate(generated_data):
-                    grad_cam_real_local, grad_cam_fake_local, real_prob, fake_prob = grad_cam.apply(subout.unsqueeze(dim=0), generation_config)
-                    grad_cam_real.append(grad_cam_real_local.detach())
-                    grad_cam_fake.append(grad_cam_fake_local.detach())
-                    grad_cam_prob_real[idx + sample_idx * batch_size] = real_prob
-                    grad_cam_prob_fake[idx + sample_idx * batch_size] = fake_prob
-                del grad_cam
-                flush_data(funcname)
-            if self.lime is not None:
-                with torch.no_grad():
-                    train_data = train_config['train_dataset']
-                    train_labels = train_config['train_labels'] if 'train_labels' in train_config.keys() and isinstance(train_data, torch.Tensor) else None
-                    
-                    lime_helper = LIME(self, self.explanation_config['lime'])
-                    X, y, weights_batch, features = lime_helper.generate_data_for_ml(train_data, train_labels, batch_size, generated_data)
-                    
-                    for idx, subout in enumerate(generated_data):
-                        formatted_idx = '0' * (max_field_size - len(str(idx + sample_idx * batch_size))) + str(idx + sample_idx * batch_size)
-                        weights = weights_batch[:, idx]
-                        explanation = self.lime.explain_sample(subout, X, y, weights, features, result_dir, formatted_idx, self.explanation_config, generation_config)
-                        if check_nodes_count:
-                            lime_nodes_counts.append(explanation['nodes_count'])
-                    del X, y, weights_batch, weights, features, lime_helper
-                flush_data(funcname)
-            del generated_data, subout
+                    formatted_idx = '0' * (max_field_size - len(str(idx + sample_idx * batch_size))) + str(idx + sample_idx * batch_size)
+                    weights = weights_batch[:, idx]
+                    explanation = self.lime.explain_sample(subout, X, y, weights, features, lime_dir, formatted_idx, self.explanation_config, generation_config)
+                    if check_nodes_count:
+                        lime_nodes_counts.append(explanation['nodes_count'])
+                del X, y, weights_batch, weights, features, lime_helper
+            flush_data(funcname)
+            if check_nodes_count:
+                generation_explanation['lime'] = {}
+                generation_explanation['lime']['mean_nodes_count'] = sum(lime_nodes_counts) // len(lime_nodes_counts)
+
         if self.genspace_run:
             with torch.no_grad():
                 genspace = GenSpace(self, self.explanation_config['genspace'])
@@ -314,6 +335,7 @@ class GAN:
                 genspace_counts = genspace.explain_space(X, y, batch_size, result_dir)
                 del X, y, genspace
             flush_data(funcname)
+
         if self.shap_gen_run:
             with torch.no_grad():
                 shap_gen = ShapGen(self, self.generator, self.explanation_config['shap_gen']['model'])
@@ -326,12 +348,9 @@ class GAN:
                     columns = self.explanation_config['shap_gen']['columns']
                 X, y = shap_gen.generate_data_for_ml(train_data, train_labels, batch_size)
                 shap_gen.fit_ml(X, y)
-                shap_gen.explain(self.explanation_config['shap_gen'], self._get_noize, columns, result_dir)
+                shap_gen.explain(self.explanation_config['shap_gen'], self._get_noize, noize, columns, result_dir)
                 del X, y, columns, shap_gen
             flush_data(funcname)
-
-        if check_nodes_count:
-            generation_explanation['lime_mean_nodes_count'] = sum(lime_nodes_counts) // len(lime_nodes_counts)
 
         if self.genspace_run:
             generation_explanation['genspace'] = {}
@@ -340,13 +359,3 @@ class GAN:
         if len(generation_explanation.keys()) > 0:
             with open(os.path.join(result_dir, 'generation_explanation.json'), 'w') as f:
                 f.write(json.dumps(generation_explanation, indent=4, sort_keys=True))
-
-        self._save_images(generated_set, result_dir, 'generated', len(generated_set))
-        if self.grad_cam_run:
-            images_dir = self._save_images(grad_cam_real, result_dir, 'grad_cam_real', len(grad_cam_real))
-            with open(os.path.join(images_dir, 'real_probabilities.json'), 'w') as f:
-                f.write(json.dumps(grad_cam_prob_real, indent=4, sort_keys=True))
-            images_dir = self._save_images(grad_cam_fake, result_dir, 'grad_cam_fake', len(grad_cam_fake))
-            with open(os.path.join(images_dir, 'fake_probabilities.json'), 'w') as f:
-                f.write(json.dumps(grad_cam_prob_fake, indent=4, sort_keys=True))
-            del grad_cam_real, grad_cam_fake

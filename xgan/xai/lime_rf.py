@@ -23,6 +23,8 @@ class LimeRandomForest(LimeModel):
 	def explain_sample(self, explained_sample, X, y, weights, features, prefix_path, formatted_idx, explanation_config, generation_config):
 		self.model.fit(X, y, sample_weight=weights)
 		explanation = {}
+		if not os.path.exists(prefix_path):
+			os.makedirs(prefix_path)
 		if 'features' in explanation_config['lime'].keys():
 			if 'explain_model' in explanation_config['lime']['features']:
 				self._explain_model(generation_config, formatted_idx, features, prefix_path)

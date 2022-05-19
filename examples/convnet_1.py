@@ -1,12 +1,6 @@
 import numpy as np
 import gc
 
-try:
-    from sklearnex import patch_sklearn
-    patch_sklearn()
-except:
-    pass
-
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR
@@ -16,6 +10,12 @@ from xgan.models import Convnet1
 from xgan import GAN
 from xgan.xai import LimeRandomForest
 from xgan.utils import prepare_batches
+
+try:
+  from sklearnex import patch_sklearn
+  patch_sklearn()
+except:
+  pass
 
 from sklearn.ensemble import RandomForestClassifier
 
@@ -44,7 +44,7 @@ def main():
     test_X, test_y = convert_data_to_tensor(testset, dtype)
     gc.collect()
     torch.cuda.empty_cache()
-    gan_lr = 0.0004
+    gan_lr = 0.0003
     criterion = torch.nn.BCELoss()
     convnet = Convnet1()
 
@@ -73,19 +73,18 @@ def main():
             'features' : ['explain_model', 'nodes_count']
         },
         'genspace': {
-            'model' : RandomForestClassifier(n_estimators=100, max_depth=12),
+            'model' : RandomForestClassifier(n_estimators=125, max_depth=12),
             'samples_to_generate' : 1000
         },
         'shap_gen': {
-            'model': RandomForestClassifier(n_estimators=100, max_depth=12),
-            'background_samples_to_gen': 100,
-            'test_samples_to_gen': 5,
-            'shap_nsamples': 125,
-            'features': ['summary', 'waterfall', 'dependence']
+            'model': RandomForestClassifier(n_estimators=125, max_depth=12),
+            'background_samples_to_gen': 75,
+            'shap_nsamples': 200,
+            'features': ['summary', 'waterfall']
         }
     }
     generation_config = {
-        'samples_number': 3,
+        'samples_number': 5,
         'batch_size' : 256,
         'save_examples' : True,
         'save_models': True,
@@ -93,9 +92,9 @@ def main():
     }
     
     generator_config['optimizer'] = optim.Adam(generator_config['model'].parameters(), lr=gan_lr, betas=(0.5, 0.999))
-    generator_config['scheduler'] = ExponentialLR(generator_config['optimizer'], gamma=0.98)
+    generator_config['scheduler'] = ExponentialLR(generator_config['optimizer'], gamma=0.99)
     discriminator_config['optimizer'] = optim.Adam(discriminator_config['model'].parameters(), lr=gan_lr, betas=(0.5, 0.999))
-    discriminator_config['scheduler'] = ExponentialLR(discriminator_config['optimizer'], gamma=0.98)
+    discriminator_config['scheduler'] = ExponentialLR(discriminator_config['optimizer'], gamma=0.99)
 
     device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
     gan = GAN(device, generator_config, discriminator_config, verbose=True, explanation_config=explanation_config, dtype=dtype)
@@ -103,7 +102,7 @@ def main():
     train_config = {
         'epochs' : 150,
         'discr_per_gener_iters' : 3,
-        'iterations_between_saves': 8,
+        'iterations_between_saves': 25,
         'batch_size': 256,
         'train_dataset': train_X,
         'train_labels': train_y,
